@@ -48,7 +48,9 @@ This project provides a complete pipeline for programming, simulating, and physi
 
 ## Features
 ![Alt text](docs/images/hi_world.png)
+
 ![Alt text](docs/images/Robot.png)
+
 ![Alt text](docs/images/Nour.png)
 ### Browser Simulation (`robot_arm_planner_sorting.html`)
 
