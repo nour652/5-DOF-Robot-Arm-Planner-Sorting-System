@@ -1,0 +1,1476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>5-DOF Robot Arm Planner</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; background: #0d1520; font-family: monospace; }
+    input[type=range] { cursor: pointer; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #060c18; }
+    ::-webkit-scrollbar-thumb { background: #1e3248; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #2e5470; }
+    .app-container { display: flex; height: 100vh; width: 100vw; overflow: hidden; }
+    .panel-left { width: 340px; background: #0b1120; border-right: 1px solid #162235; display: flex; flex-direction: column; flex-shrink: 0; z-index: 10; }
+    .panel-right { flex: 1; position: relative; display: flex; flex-direction: column; overflow: hidden; }
+    @media (max-width: 800px) {
+      .app-container { flex-direction: column; overflow-y: auto; overflow-x: hidden; }
+      .panel-left { width: 100%; height: 55vh; border-right: none; border-bottom: 2px solid #162235; flex-shrink: 0; }
+      .panel-right { width: 100%; height: 45vh; flex-shrink: 0; }
+    }
+  </style>
+<base target="_blank">
+<base target="_blank">
+<base target="_blank">
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const DEG = Math.PI / 180;
+
+    function dhT(theta_deg, d, a, alpha_deg) {
+      const th = theta_deg * DEG, al = alpha_deg * DEG;
+      const cth = Math.cos(th), sth = Math.sin(th), cal = Math.cos(al), sal = Math.sin(al);
+      return new THREE.Matrix4().set(
+        cth, -sth*cal,  sth*sal, a*cth,
+        sth,  cth*cal, -cth*sal, a*sth,
+          0,      sal,      cal,     d,
+          0,        0,        0,     1
+      );
+    }
+
+    function fk(angles, params) {
+      let T = new THREE.Matrix4();
+      const pos  = [new THREE.Vector3()];
+      const mats = [T.clone()];
+      for (let i = 0; i < params.length; i++) {
+        T = T.clone().multiply(dhT(angles[i], params[i].d, params[i].a, params[i].alpha));
+        mats.push(T.clone());
+        pos.push(new THREE.Vector3().setFromMatrixPosition(T));
+      }
+      return { pos, mats };
+    }
+
+    function jacobian(angles, params, eps = 0.4) {
+      const ee0 = fk(angles, params).pos.at(-1);
+      return angles.map((_, i) => {
+        const a2 = [...angles]; a2[i] += eps;
+        const ee2 = fk(a2, params).pos.at(-1);
+        return [(ee2.x-ee0.x)/eps, (ee2.y-ee0.y)/eps, (ee2.z-ee0.z)/eps];
+      });
+    }
+
+    function solve3x3(A, b) {
+      const M = A.map((r, i) => [...r, b[i]]);
+      for (let c = 0; c < 3; c++) {
+        let p = c;
+        for (let r = c+1; r < 3; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+        [M[c], M[p]] = [M[p], M[c]];
+        for (let r = 0; r < 3; r++) {
+          if (r === c || Math.abs(M[c][c]) < 1e-12) continue;
+          const f = M[r][c] / M[c][c];
+          for (let k = c; k <= 3; k++) M[r][k] -= f * M[c][k];
+        }
+      }
+      return [0,1,2].map(i => M[i][3] / (M[i][i] || 1));
+    }
+
+    function getKinematicLimits(s) {
+      const min = parseFloat(s.min) || 0;
+      const max = parseFloat(s.max) || 180;
+      const zero = parseFloat(s.zero) || 90;
+      let min_k, max_k;
+      if (!s.reversed) {
+        min_k = min - zero;
+        max_k = max - zero;
+      } else {
+        min_k = zero - max;
+        max_k = zero - min;
+      }
+      return [min_k, max_k];
+    }
+
+    function solveIK(target, initAngles, params, servoCfg, lambda = 0.5, maxIter = 600) {
+      let ang = [...initAngles];
+      const LIM = servoCfg.map(getKinematicLimits);
+      for (let it = 0; it < maxIter; it++) {
+        const ee = fk(ang, params).pos.at(-1);
+        const e  = [target.x-ee.x, target.y-ee.y, target.z-ee.z];
+        if (Math.hypot(...e) < 0.04) break;
+        const Jcol = jacobian(ang, params);
+        const Jr   = [[],[],[]];
+        Jcol.forEach(col => col.forEach((v, r) => Jr[r].push(v)));
+        const JJT = [[0,0,0],[0,0,0],[0,0,0]];
+        for (let r = 0; r < 3; r++)
+          for (let s = 0; s < 3; s++)
+            for (let k = 0; k < ang.length; k++) JJT[r][s] += Jr[r][k]*Jr[s][k];
+        for (let i = 0; i < 3; i++) JJT[i][i] += lambda*lambda;
+        let x;
+        try { x = solve3x3(JJT, e); } catch(err) { break; }
+        const dth = ang.map((_, c) => Jr.reduce((s, row, r) => s + row[c]*x[r], 0));
+        ang = ang.map((a, i) => Math.max(LIM[i][0], Math.min(LIM[i][1], a + 0.75*dth[i])));
+      }
+      return ang;
+    }
+
+    function interpAngles(a, b, t) {
+      const s = 3*t*t - 2*t*t*t;
+      return a.map((v, i) => v + (b[i]-v)*s);
+    }
+
+    function dh3(v) { return new THREE.Vector3(v.x, v.z, v.y); }
+
+    const DEFAULT_PARAMS = [
+      { label:"Base Yaw",    d:8.5, a:0,   alpha: 90, known:{d:true} },
+      { label:"Shoulder",    d:0,   a:10,  alpha:  0, known:{a:true} },
+      { label:"Elbow",       d:0,   a:12.5,alpha:  0, known:{a:true} },
+      { label:"Wrist Pitch", d:0,   a:0,   alpha: 90, known:{} },
+      { label:"End-Eff.",    d:11,  a:0,   alpha:  0, known:{} },
+    ];
+
+    const DEFAULT_ANGLES = [0, 60, -120, 60, 0, 0];
+
+    const DEFAULT_SERVO_CFG = [
+      { channel:0, label:"Base Yaw",    reversed:false, zero:90, min:0,   max:180, trim:0 },
+      { channel:1, label:"Shoulder",    reversed:true,  zero:90, min:30,  max:160, trim:0 },
+      { channel:2, label:"Elbow",       reversed:true,  zero:90, min:15,  max:165, trim:0 },
+      { channel:3, label:"Wrist Pitch", reversed:false, zero:90, min:20,  max:160, trim:0 },
+      { channel:4, label:"Wrist Roll",  reversed:false, zero:90, min:0,   max:180, trim:0 },
+      { channel:5, label:"Gripper",     reversed:false, zero:90, min:0,   max:180, trim:0 },
+    ];
+
+    const LINK_HEX = ["#00d4ff","#00ff9f","#ffb800","#ff5f5f","#b06eff","#ff8c00"];
+    const LINK_INT = [0x00d4ff, 0x00ff9f, 0xffb800, 0xff5f5f, 0xb06eff, 0xff8c00];
+
+    const C = {
+      bg:"#0d1520", panel:"#0b1120", card:"#0f1929", border:"#162235",
+      dimmer:"#1e3248", dim:"#3d5470", text:"#dde6f0", accent:"#00d4ff",
+      gold:"#ffb800", danger:"#ff5563", success:"#00ff9f", mcu:"#7c3aed", mcuL:"#a78bfa",
+    };
+
+    function Btn({ children, onClick, color=C.accent, style={} }) {
+      return (
+        <button onClick={onClick} style={{
+          background:`${color}22`, color, border:`1px solid ${color}44`,
+          borderRadius:5, padding:"6px 10px", fontSize:11, cursor:"pointer",
+          fontFamily:"monospace", fontWeight:"bold", width:"100%",
+          transition:"all 0.15s", ...style
+        }}
+          onMouseOver={(e) => e.currentTarget.style.background = `${color}44`}
+          onMouseOut={(e) => e.currentTarget.style.background = `${color}22`}>
+          {children}
+        </button>
+      );
+    }
+
+    function Card({ children, style={} }) {
+      return <div style={{ background:C.card, borderRadius:7, padding:"9px 10px", border:`1px solid ${C.border}`, marginBottom:10, ...style }}>{children}</div>;
+    }
+    function Sec({ children, color=C.gold }) {
+      return <div style={{ fontSize:10, color, fontWeight:"bold", marginBottom:8, marginTop:4, letterSpacing:"0.07em", textTransform:"uppercase" }}>{children}</div>;
+    }
+    function Row({ l, v, vc=C.text }) {
+      return (
+        <div style={{ display:"flex", justifyContent:"space-between", fontSize:10.5, marginBottom:3 }}>
+          <span style={{ color:C.dim }}>{l}</span>
+          <span style={{ color:vc, fontFamily:"monospace" }}>{v}</span>
+        </div>
+      );
+    }
+    const INP = { background:"#060c18", border:`1px solid ${C.border}`, color:C.text, padding:"5px 8px", borderRadius:5, fontSize:11, fontFamily:"monospace", width:"100%", boxSizing:"border-box", outline:"none" };
+
+    function generateCode(waypoints, servoCfg, loopPath, mcuCfg, defaultAngles) {
+      const { i2cAddr, pwmFreq, ssid, password } = mcuCfg;
+      const N  = waypoints.length;
+      const NJ = servoCfg.length;
+
+      const wpLines = N > 0 ? waypoints.map((wp, wi) => "  { " + wp.angles.map(a => a.toFixed(1) + "f").join(", ") + " }, // Step " + (wi+1) + ": " + wp.label).join("\n") : "  // Populated dynamically";
+      const durLines = N > 0 ? waypoints.map((wp, wi) => "  " + Math.round(1000 / wp.speed) + ", // Step " + (wi+1) + " -> " + (wi+2) + ": " + wp.label).join("\n") : "  // Populated dynamically";
+      const chLines  = servoCfg.map((s,i) => "  " + s.channel + ", // J"+(i+1)).join("\n");
+      const revLines = servoCfg.map((s,i) => "  " + (s.reversed?"true":"false") + ", // J"+(i+1)).join("\n");
+      const zeroLines= servoCfg.map((s,i) => "  " + s.zero.toFixed(1) + "f, // J"+(i+1)).join("\n");
+      const minLines = servoCfg.map((s,i) => "  " + s.min.toFixed(1) + "f, // J"+(i+1)).join("\n");
+      const maxLines = servoCfg.map((s,i) => "  " + s.max.toFixed(1) + "f, // J"+(i+1)).join("\n");
+      const trimLines= servoCfg.map((s,i) => "  " + s.trim.toFixed(1) + "f, // J"+(i+1)).join("\n");
+      const stLines  = defaultAngles.map((a,i) => "  " + a.toFixed(1) + "f, // J"+(i+1)).join("\n");
+      const sliderRows = servoCfg.map((s, i) => {
+        const [minK, maxK] = getKinematicLimits(s);
+        const st = defaultAngles[i].toFixed(1);
+        return `<div class=row><label>J${i+1} ${s.label.substring(0,8)}</label><input type=range min=${minK} max=${maxK} value=${st} id=s${i} oninput=\\"mv(${i},this.value)\\"><span class=v id=v${i}>${st}</span></div>`;
+      }).join("");
+
+      return `// ================================================================
+// ESP32 + PCA9685 + WiFi Web Server — 5-DOF Arm Planner
+// Auto-generated. Open Serial Monitor @ 115200 for IP.
+// ================================================================
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+const char* ssid     = "${ssid}";
+const char* password = "${password}";
+WebServer server(80);
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(${i2cAddr});
+
+#define SERVOMIN  102
+#define SERVOMAX  512
+#define SERVO_FREQ ${pwmFreq}
+#define NUM_JOINTS ${NJ}
+#define MAX_STEPS  100
+bool loopPath = ${loopPath ? "true" : "false"};
+
+const uint8_t CH[NUM_JOINTS] = {\n${chLines}\n};
+const bool REV[NUM_JOINTS] = {\n${revLines}\n};
+const float ZERO[NUM_JOINTS] = {\n${zeroLines}\n};
+const float MIN_ANG[NUM_JOINTS] = {\n${minLines}\n};
+const float MAX_ANG[NUM_JOINTS] = {\n${maxLines}\n};
+const float TRIM[NUM_JOINTS] = {\n${trimLines}\n};
+const float START_DEG[NUM_JOINTS] = {\n${stLines}\n};
+
+int pathLength = ${N};
+float waypoints[MAX_STEPS][NUM_JOINTS] = {
+${wpLines}
+};
+uint32_t segDur[MAX_STEPS] = {
+${durLines}
+};
+
+int curPulse[NUM_JOINTS];
+volatile bool pathRun  = false;
+volatile bool pathStop = false;
+String pathMsg  = "Ready";
+
+uint16_t angleToPulse(int j, float k_deg) {
+  float phys = k_deg;
+  if (REV[j]) phys = -phys;
+  phys += ZERO[j] + TRIM[j];
+  phys = constrain(phys, MIN_ANG[j], MAX_ANG[j]);
+  return (uint16_t)map((long)phys, 0, 180, SERVOMIN, SERVOMAX);
+}
+
+void moveJoint(int j, float deg, int ms) {
+  int target = angleToPulse(j, deg);
+  int start  = curPulse[j];
+  if (target == start) return;
+  int steps   = abs(target - start);
+  int delayUs = max(1, (ms * 1000) / steps);
+  if (start < target)
+    for (int p = start; p <= target; p++) { pwm.setPWM(CH[j], 0, p); delayMicroseconds(delayUs); }
+  else
+    for (int p = start; p >= target; p--) { pwm.setPWM(CH[j], 0, p); delayMicroseconds(delayUs); }
+  curPulse[j] = target;
+}
+
+void moveAll(float degs[NUM_JOINTS], uint32_t ms) {
+  int targets[NUM_JOINTS], starts[NUM_JOINTS], maxSteps = 0;
+  for (int j = 0; j < NUM_JOINTS; j++) {
+    starts[j]  = curPulse[j];
+    targets[j] = angleToPulse(j, degs[j]);
+    maxSteps   = max(maxSteps, abs(targets[j] - starts[j]));
+  }
+  if (maxSteps == 0) return;
+  int delayUs = max(1, (int)((ms * 1000UL) / maxSteps));
+  for (int s = 0; s <= maxSteps; s++) {
+    float t = (float)s / maxSteps;
+    float ts = t * t * (3.0f - 2.0f * t);
+    for (int j = 0; j < NUM_JOINTS; j++)
+      pwm.setPWM(CH[j], 0, starts[j] + (int)((targets[j]-starts[j]) * ts));
+    delayMicroseconds(delayUs);
+  }
+  for (int j = 0; j < NUM_JOINTS; j++) curPulse[j] = targets[j];
+}
+
+void initJoints() {
+  for (int j = 0; j < NUM_JOINTS; j++) {
+    int target = angleToPulse(j, START_DEG[j]);
+    int steps  = abs(target - SERVOMIN);
+    int dUs    = max(1, (900 * 1000) / max(steps, 1));
+    for (int p = SERVOMIN; p <= target; p++) { pwm.setPWM(CH[j], 0, p); delayMicroseconds(dUs); }
+    curPulse[j] = target;
+    delay(250);
+  }
+}
+
+const char PAGE[] PROGMEM = "<!DOCTYPE html><html><head><meta name=viewport content=width=device-width,initial-scale=1><title>Robot Arm</title><style>body{font-family:Arial;background:#0d1117;color:#e6edf3;padding:12px;margin:0}h2{color:#58a6ff;text-align:center;margin-bottom:14px}.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px}.row{display:flex;align-items:center;gap:8px;margin-bottom:6px}.row label{font-size:.8em;color:#8b949e;min-width:100px}input[type=range]{flex:1;accent-color:#58a6ff}.v{font-weight:bold;color:#58a6ff;min-width:36px;font-size:.85em}.btn{width:100%;padding:9px;border:none;border-radius:6px;font-weight:bold;cursor:pointer;margin-top:5px}.gr{background:#238636;color:#fff}.rd{background:#da3633;color:#fff}.gy{background:#21262d;color:#8b949e;border:1px solid #30363d}.st{text-align:center;font-size:.8em;color:#8b949e;margin-top:6px}input[type=number]{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:4px;padding:4px 6px;width:70px}</style></head><body><h2>&#129470; Robot Arm</h2><div class=card><b style=font-size:.85em>Move time (ms):</b> <input type=number id=ms value=1000 min=100 step=100></div><div class=card>${sliderRows}<button class=\\"btn gy\\" onclick=\\"rst()\\">Reset (Home)</button></div><div class=card><b style=font-size:.85em>Path Control</b><button class=\\"btn gr\\" onclick=\\"run()\\">&#9654; Run Path</button><button class=\\"btn rd\\" onclick=\\"stp()\\" style=margin-top:6px>&#9209; Stop</button><div class=st id=st>Ready</div></div><script>function mv(n,v){document.getElementById('v'+n).innerText=v;fetch('/set?servo='+n+'&angle='+v+'&time='+document.getElementById('ms').value);}function rst(){fetch('/reset');const st=[${defaultAngles.map(a=>a.toFixed(1)).join(",")}];for(let i=0;i<${servoCfg.length};i++){var s=document.getElementById('s'+i);if(s){s.value=st[i];document.getElementById('v'+i).innerText=st[i];}}}function run(){fetch('/run');document.getElementById('st').innerText='Running...';}function stp(){fetch('/stop');document.getElementById('st').innerText='Stopped.';}setInterval(()=>fetch('/status').then(r=>r.text()).then(t=>{if(t)document.getElementById('st').innerText=t;}),800);<\/script></body></html>";
+
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(SERVO_FREQ);
+  initJoints();
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\\nWiFi Connected. IP: " + WiFi.localIP().toString());
+
+  server.on("/", []() { sendCORS(); server.send_P(200, "text/html", PAGE); });
+  server.on("/set", []() {
+    sendCORS();
+    moveJoint(server.arg("servo").toInt(), server.arg("angle").toFloat(), server.arg("time").toInt());
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/set_all", []() {
+    sendCORS();
+    float degs[NUM_JOINTS];
+    for (int j = 0; j < NUM_JOINTS; j++) degs[j] = server.arg("j" + String(j)).toFloat();
+    moveAll(degs, server.arg("time").toInt());
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/reset", []() {
+    sendCORS();
+    for (int j = 0; j < NUM_JOINTS; j++) moveJoint(j, START_DEG[j], 1000);
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/run", []() { sendCORS(); pathStop = false; pathRun = true; server.send(200, "text/plain", "OK"); });
+  server.on("/stop", []() { sendCORS(); pathStop = true; pathRun = false; pathMsg = "Stopped."; server.send(200, "text/plain", "OK"); });
+  server.on("/status", []() { sendCORS(); server.send(200, "text/plain", pathMsg); });
+  server.on("/clear_path", []() { sendCORS(); pathLength = 0; server.send(200, "text/plain", "OK"); });
+  server.on("/add_wp", []() {
+    sendCORS();
+    if (pathLength < MAX_STEPS) {
+      for (int j = 0; j < NUM_JOINTS; j++) waypoints[pathLength][j] = server.arg("j" + String(j)).toFloat();
+      segDur[pathLength] = server.arg("time").toInt();
+      pathLength++;
+      server.send(200, "text/plain", "OK");
+    } else { server.send(400, "text/plain", "Path Full"); }
+  });
+  server.onNotFound([]() {
+    if (server.method() == HTTP_OPTIONS) { sendCORS(); server.send(204); }
+    else { sendCORS(); server.send(404, "text/plain", "Not found"); }
+  });
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  if (pathRun && !pathStop && pathLength >= 2) {
+    pathRun = false;
+    for (int i = 0; i < pathLength - 1 && !pathStop; i++) {
+      pathMsg = "Step " + String(i+1) + "/" + String(pathLength);
+      moveAll(waypoints[i+1], segDur[i]);
+      server.handleClient();
+    }
+    if (!pathStop) {
+      if (loopPath) { pathRun = true; pathMsg = "Looping..."; }
+      else { pathMsg = "Done."; }
+    }
+  }
+}`;
+    }
+
+    function makeCircle() {
+      const pts = [], n=16, cx=15, r=6, z=9;
+      for (let i=0; i<=n; i++) {
+        const t = (i/n)*2*Math.PI;
+        pts.push({ label:`C${i+1}`, x:+(cx+r*Math.cos(t)).toFixed(1), y:+(r*Math.sin(t)).toFixed(1), z });
+      }
+      return { name:"Circle", type:"cartesian", speed:1.5, points:pts };
+    }
+    function makeHeart() {
+      const pts = [], n=24, cx=15, sc=0.38, z=9;
+      for (let i=0; i<=n; i++) {
+        const t = (i/n)*2*Math.PI;
+        const hx = 16*Math.pow(Math.sin(t),3);
+        const hy = 13*Math.cos(t)-5*Math.cos(2*t)-2*Math.cos(3*t)-Math.cos(4*t);
+        pts.push({ label:`H${i+1}`, x:+(cx+hy*sc).toFixed(1), y:+(hx*sc).toFixed(1), z });
+      }
+      return { name:"Heart", type:"cartesian", speed:1.2, points:pts };
+    }
+    function makeFigure8() {
+      const pts = [], n=20, cx=15, rx=5, ry=4, z=9;
+      for (let i=0; i<=n; i++) {
+        const t = (i/n)*2*Math.PI;
+        pts.push({ label:`F${i+1}`, x:+(cx+rx*Math.sin(t)).toFixed(1), y:+(ry*Math.sin(2*t)/2).toFixed(1), z });
+      }
+      return { name:"Figure-8", type:"cartesian", speed:1.5, points:pts };
+    }
+    function makeSquare() {
+      return { name:"Square", type:"cartesian", speed:1.5, points:[
+        {label:"TL",x:19,y:-6,z:9},{label:"TR",x:19,y:6,z:9},
+        {label:"BR",x:11,y:6,z:9},{label:"BL",x:11,y:-6,z:9},
+        {label:"TL",x:19,y:-6,z:9}
+      ]};
+    }
+    function makeSpiral() {
+      const pts = [], n=24, cx=15, z0=5, zTop=14;
+      for (let i=0; i<=n; i++) {
+        const t = (i/n)*2*Math.PI*2;
+        const r = 3+4*(i/n);
+        const z = +(z0+(zTop-z0)*(i/n)).toFixed(1);
+        pts.push({ label:`S${i+1}`, x:+(cx+r*Math.cos(t)).toFixed(1), y:+(r*Math.sin(t)).toFixed(1), z });
+      }
+      return { name:"Spiral", type:"cartesian", speed:1.2, points:pts };
+    }
+    const PRESETS = { circle:makeCircle, heart:makeHeart, figure8:makeFigure8, square:makeSquare, spiral:makeSpiral };
+
+    function App() {
+      const [params, setParams]       = useState(DEFAULT_PARAMS);
+      const [angles, setAngles]       = useState(DEFAULT_ANGLES);
+      const [tab, setTab]             = useState("fk");
+      const [ikTarget, setIkTarget]   = useState({ x:"12", y:"10", z:"3" });
+      const [ikSol, setIkSol]         = useState(null);
+      const [ikErr, setIkErr]         = useState(null);
+      const [ikApplied, setIkApplied] = useState(false);
+      const [waypoints, setWaypoints] = useState([]);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const [playIdx, setPlayIdx]     = useState(0);
+      const [playT, setPlayT]         = useState(0);
+      const [loopPath, setLoopPath]   = useState(false);
+      const [showTrail, setShowTrail] = useState(true);
+      const [trailPts, setTrailPts]   = useState([]);
+      const [importJSON, setImportJSON]   = useState("");
+      const [importError, setImportError] = useState("");
+      const [showImport, setShowImport]   = useState(false);
+      const [servoCfg, setServoCfg]   = useState(DEFAULT_SERVO_CFG);
+      const [mcuCfg, setMcuCfg]       = useState({ i2cAddr:"0x40", pwmFreq:50, ssid:"YOUR_WIFI_SSID", password:"YOUR_WIFI_PASSWORD" });
+      const [esp32ip, setEsp32ip]     = useState("192.168.1.100");
+      const [copied, setCopied]       = useState(false);
+      const [mcuSubTab, setMcuSubTab] = useState("config");
+      const [sensorTab, setSensorTab] = useState("control");
+      const [sensorEnabled, setSensorEnabled] = useState(false);
+      const [usTrigger, setUsTrigger] = useState(false);
+      const [indTrigger, setIndTrigger] = useState(false);
+      const [bothTrigger, setBothTrigger] = useState(false);
+      const [ultrasonicDist, setUltrasonicDist] = useState(0);
+      const [metalPath, setMetalPath] = useState([]);
+      const [noMetalPath, setNoMetalPath] = useState([]);
+      const [syncStatus, setSyncStatus] = useState("");
+      const [liveSyncEnabled, setLiveSyncEnabled] = useState(false);
+      const [savedPaths, setSavedPaths] = useState(() => { try { return JSON.parse(localStorage.getItem("robotPaths") || "[]"); } catch(e) { return []; } });
+      const [editingPathId, setEditingPathId] = useState(null);
+      const [editPathName, setEditPathName] = useState("");
+
+      const canvasRef    = useRef(null);
+      const sceneRefs    = useRef({});
+      const animRef      = useRef(null);
+      const isPlayingRef = useRef(false);
+
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setClearColor(0x0d1520);
+        const scene = new THREE.Scene();
+        scene.add(new THREE.AmbientLight(0x1a2535, 1.6));
+        const dl = new THREE.DirectionalLight(0xffffff, 1.1); dl.position.set(30, 50, 20); scene.add(dl);
+        const pt1 = new THREE.PointLight(0x00d4ff, 2, 65); pt1.position.set(-10, 20, 5); scene.add(pt1);
+        const pt2 = new THREE.PointLight(0xb06eff, 1.4, 50); pt2.position.set(10, 5, -10); scene.add(pt2);
+        scene.add(new THREE.GridHelper(100, 100, 0x4a7a9b, 0x2e5f7a));
+        const makeAxis = (dir, color) => new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), dir]),
+          new THREE.LineBasicMaterial({ color, linewidth: 2 })
+        );
+        scene.add(makeAxis(new THREE.Vector3(7, 0, 0), 0xff0000));
+        scene.add(makeAxis(new THREE.Vector3(0, 0, 7), 0x00ff00));
+        scene.add(makeAxis(new THREE.Vector3(0, 7, 0), 0x0000ff));
+        const armGroup = new THREE.Group(); scene.add(armGroup);
+        const tMesh = null; // pink octahedron removed
+        const pathLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color:0xffb800, transparent:true, opacity:0.55 }));
+        scene.add(pathLine);
+        const trailLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color:0x00d4ff, transparent:true, opacity:0.4 }));
+        scene.add(trailLine);
+        const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 500);
+        camera.position.set(30, 40, 45);
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 9, 0);
+        controls.maxDistance = 200;
+        sceneRefs.current = { renderer, scene, camera, controls, armGroup, tMesh, pathLine, trailLine };
+        let rafId;
+        const loop = () => {
+          rafId = requestAnimationFrame(loop);
+          controls.update();
+          const t = Date.now() * 0.002;
+          armGroup.children.forEach((c, i) => {
+            if (c.geometry && c.geometry.type === "TorusGeometry")
+              c.material.emissiveIntensity = 0.38 + 0.28*Math.sin(t+i);
+          });
+          renderer.render(scene, camera);
+        };
+        loop();
+        const ro = new ResizeObserver(() => {
+          const w = canvas.clientWidth, h = canvas.clientHeight;
+          if (w > 0 && h > 0) {
+            renderer.setSize(w, h, false);
+            camera.aspect = w/h;
+            camera.updateProjectionMatrix();
+          }
+        });
+        ro.observe(canvas);
+        return () => { cancelAnimationFrame(rafId); ro.disconnect(); renderer.dispose(); };
+      }, []);
+
+      useEffect(() => {
+        const { armGroup, tMesh, trailLine } = sceneRefs.current;
+        if (!armGroup) return;
+        const { pos, mats } = fk(angles, params);
+        while (armGroup.children.length) {
+          const c = armGroup.children[0];
+          if (c.geometry) c.geometry.dispose();
+          if (c.material) c.material.dispose();
+          armGroup.remove(c);
+        }
+        pos.forEach((p, i) => {
+          if (i === 0) return;
+          const A = dh3(pos[i-1]), B = dh3(p);
+          const dir = B.clone().sub(A), len = dir.length();
+          if (len > 0.05) {
+            const mesh = new THREE.Mesh(
+              new THREE.CylinderGeometry(0.28, 0.28, len, 20),
+              new THREE.MeshPhongMaterial({ color:LINK_INT[i-1], shininess:130 })
+            );
+            mesh.position.copy(A.clone().lerp(B, 0.5));
+            mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+            armGroup.add(mesh);
+            const ring = new THREE.Mesh(
+              new THREE.TorusGeometry(0.62, 0.11, 10, 28),
+              new THREE.MeshPhongMaterial({ color:LINK_INT[i-1], emissive:LINK_INT[i-1], emissiveIntensity:0.55, transparent:true, opacity:0.7 })
+            );
+            ring.position.copy(dh3(p));
+            ring.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+            armGroup.add(ring);
+          }
+          const sp = new THREE.Mesh(
+            new THREE.SphereGeometry(0.48, 18, 18),
+            new THREE.MeshPhongMaterial({ color:0xffffff, emissive:0x222222, shininess:200 })
+          );
+          sp.position.copy(dh3(p));
+          armGroup.add(sp);
+        });
+        // End effector gripper geometry
+        const eePos = dh3(pos.at(-1));
+        const finalMat = mats.at(-1);
+        const approach = new THREE.Vector3(finalMat.elements[8], finalMat.elements[10], finalMat.elements[9]).normalize();
+        const openAxis = new THREE.Vector3(finalMat.elements[0], finalMat.elements[2], finalMat.elements[1]).normalize();
+
+        // Wrist mount
+        const mount = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.45, 0.55, 0.7, 16),
+          new THREE.MeshPhongMaterial({ color: 0x8899aa, shininess: 160 })
+        );
+        mount.position.copy(eePos);
+        mount.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), approach);
+        armGroup.add(mount);
+
+        // Gripper fingers — animate open/close based on J6 angle
+        const gAngle = angles[5] || 0;
+        const gT = Math.max(0, Math.min(1, (gAngle + 90) / 180));
+        const separation = 0.55 - 0.48 * gT;
+        const fingerGeo = new THREE.BoxGeometry(0.14, 1.1, 0.32);
+        const fingerMat = new THREE.MeshPhongMaterial({ color: 0xc0d0e0, shininess: 180 });
+        const leftFinger = new THREE.Mesh(fingerGeo, fingerMat);
+        const rightFinger = new THREE.Mesh(fingerGeo, fingerMat);
+        leftFinger.position.copy(eePos).add(openAxis.clone().multiplyScalar(separation)).add(approach.clone().multiplyScalar(0.35));
+        rightFinger.position.copy(eePos).add(openAxis.clone().multiplyScalar(-separation)).add(approach.clone().multiplyScalar(0.35));
+        leftFinger.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), approach);
+        rightFinger.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), approach);
+        armGroup.add(leftFinger);
+        armGroup.add(rightFinger);
+
+        // Red tip indicator
+        const tip = new THREE.Mesh(
+          new THREE.SphereGeometry(0.22, 12, 12),
+          new THREE.MeshPhongMaterial({ color: 0xff3344, emissive: 0x881122, shininess: 200 })
+        );
+        tip.position.copy(eePos).add(approach.clone().multiplyScalar(0.95));
+        armGroup.add(tip);
+
+        /* tMesh removed */
+        if (trailLine) {
+          if (showTrail && trailPts.length > 1) {
+            trailLine.geometry.dispose();
+            trailLine.geometry = new THREE.BufferGeometry().setFromPoints(trailPts.map(p => dh3(new THREE.Vector3(p.x,p.y,p.z))));
+          } else {
+            trailLine.geometry.dispose();
+            trailLine.geometry = new THREE.BufferGeometry();
+          }
+        }
+      }, [angles, params, trailPts, showTrail]);
+
+      useEffect(() => {
+        const { pathLine } = sceneRefs.current;
+        if (!pathLine) return;
+        pathLine.geometry.dispose();
+        if (waypoints.length < 2) { pathLine.geometry = new THREE.BufferGeometry(); return; }
+        const wps = loopPath ? [...waypoints, waypoints[0]] : waypoints;
+        const pts = [];
+        for (let i = 0; i < wps.length-1; i++) {
+          for (let s = 0; s <= 60; s++) {
+            pts.push(dh3(fk(interpAngles(wps[i].angles, wps[i+1].angles, s/60), params).pos.at(-1)));
+          }
+        }
+        pathLine.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+      }, [waypoints, params, loopPath]);
+
+      useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+
+      useEffect(() => {
+        if (!isPlaying) { cancelAnimationFrame(animRef.current); return; }
+        if (waypoints.length < 2) { setIsPlaying(false); return; }
+        let idx = playIdx, t = playT, last = performance.now();
+        const wps = waypoints;
+        const step = (now) => {
+          if (!isPlayingRef.current) return;
+          const dt = (now-last)/1000; last = now;
+          t += dt * (wps[idx]?.speed ?? 1.5);
+          if (t >= 1) {
+            t = 0; idx++;
+            const maxIdx = loopPath ? wps.length : wps.length-1;
+            if (idx >= maxIdx) {
+              if (loopPath) { idx = 0; }
+              else { setIsPlaying(false); setPlayIdx(0); setPlayT(0); return; }
+            }
+            setPlayIdx(idx);
+          }
+          setPlayT(t);
+          const nextIdx = loopPath ? (idx+1)%wps.length : Math.min(idx+1, wps.length-1);
+          const cur = interpAngles(wps[idx].angles, wps[nextIdx].angles, t);
+          setAngles(cur);
+          const ee = fk(cur, params).pos.at(-1);
+          setTrailPts(prev => { const n = [...prev, {x:ee.x,y:ee.y,z:ee.z}]; return n.length>500 ? n.slice(-500) : n; });
+          animRef.current = requestAnimationFrame(step);
+        };
+        animRef.current = requestAnimationFrame(step);
+        return () => cancelAnimationFrame(animRef.current);
+      }, [isPlaying, loopPath, waypoints]);
+
+      useEffect(() => {
+        setAngles(a => a.map((v, i) => {
+          const [minK, maxK] = getKinematicLimits(servoCfg[i]);
+          return Math.max(minK, Math.min(maxK, v));
+        }));
+      }, [servoCfg]);
+
+      const { pos:fkPos } = fk(angles, params);
+      const currentEE = fkPos.at(-1);
+
+      function importPath(jsonStr, currentAngles) {
+        setImportError("");
+        let data;
+        try { data = JSON.parse(jsonStr); } catch(e) { setImportError("Invalid JSON: " + e.message); return; }
+        try {
+          let newWPs = [];
+          if (data.type === "angles") {
+            if (!Array.isArray(data.waypoints)) throw new Error('"waypoints" array required for type "angles"');
+            newWPs = data.waypoints.map((wp, i) => {
+              if (!Array.isArray(wp.angles) || wp.angles.length !== 6) throw new Error(`Waypoint ${i+1}: "angles" must be array of 6 numbers`);
+              const ee = fk(wp.angles, params).pos.at(-1);
+              return { id:Date.now()+i, label:wp.label||`${data.name||"Import"} ${i+1}`, angles:wp.angles, ee:{x:+ee.x.toFixed(2),y:+ee.y.toFixed(2),z:+ee.z.toFixed(2)}, speed:wp.speed||data.speed||1.5 };
+            });
+          } else if (data.type === "cartesian") {
+            if (!Array.isArray(data.points)) throw new Error('"points" array required for type "cartesian"');
+            let initAng = [...currentAngles];
+            newWPs = data.points.map((pt, i) => {
+              if (pt.x==null||pt.y==null||pt.z==null) throw new Error(`Point ${i+1}: x, y, z required`);
+              const sol = solveIK({x:+pt.x,y:+pt.y,z:+pt.z}, initAng, params, servoCfg);
+              initAng = sol;
+              const ee = fk(sol, params).pos.at(-1);
+              return { id:Date.now()+i, label:pt.label||`${data.name||"Import"} ${i+1}`, angles:sol, ee:{x:+ee.x.toFixed(2),y:+ee.y.toFixed(2),z:+ee.z.toFixed(2)}, speed:pt.speed||data.speed||1.5 };
+            });
+          } else {
+            throw new Error(`Unknown type "${data.type}". Use "angles" or "cartesian".`);
+          }
+          setWaypoints(wps => [...wps, ...newWPs]);
+          setImportJSON(""); setShowImport(false);
+        } catch(e) { setImportError(e.message); }
+      }
+
+      function loadPreset(key) {
+        const data = PRESETS[key]();
+        importPath(JSON.stringify(data), angles);
+      }
+
+      function runIK() {
+        const tgt = { x:parseFloat(ikTarget.x)||0, y:parseFloat(ikTarget.y)||0, z:parseFloat(ikTarget.z)||0 };
+        const sol = solveIK(tgt, angles, params, servoCfg);
+        const ee  = fk(sol, params).pos.at(-1);
+        setIkSol(sol); setIkErr(Math.hypot(tgt.x-ee.x, tgt.y-ee.y, tgt.z-ee.z)); setIkApplied(false);
+      }
+
+      function copyCode() {
+        const code = generateCode(waypoints, servoCfg, loopPath, mcuCfg, DEFAULT_ANGLES);
+        navigator.clipboard?.writeText(code).then(() => { setCopied(true); setTimeout(()=>setCopied(false), 2000); })
+        .catch(() => {
+          const ta = document.createElement("textarea"); ta.value = code; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+          setCopied(true); setTimeout(()=>setCopied(false), 2000);
+        });
+      }
+
+      function setCameraView(preset) {
+        if(!sceneRefs.current.camera || !sceneRefs.current.controls) return;
+        const { camera, controls } = sceneRefs.current;
+        controls.target.set(0, 9, 0);
+        if(preset === 'FRONT') camera.position.set(0, 9, 80);
+        if(preset === 'SIDE')  camera.position.set(80, 9, 0);
+        if(preset === 'TOP')   camera.position.set(0, 80, 0);
+        if(preset === 'HOME')  camera.position.set(30, 40, 45);
+        controls.update();
+      }
+
+      const anglesRef = useRef(angles);
+      useEffect(() => { anglesRef.current = angles; }, [angles]);
+      const liveSyncRef = useRef(false);
+      useEffect(() => { liveSyncRef.current = liveSyncEnabled; }, [liveSyncEnabled]);
+
+      useEffect(() => {
+        if (!liveSyncEnabled) return;
+        const timer = setTimeout(async () => {
+          if (!liveSyncRef.current) return;
+          try {
+            const q = anglesRef.current.map((a, j) => `j${j}=${a.toFixed(1)}`).join('&') + `&time=300`;
+            await fetch(`http://${esp32ip}/set_all?${q}`);
+            setSyncStatus("↑ Live synced");
+            setTimeout(() => setSyncStatus(""), 1200);
+          } catch (e) {}
+        }, 80);
+        return () => clearTimeout(timer);
+      }, [angles, liveSyncEnabled, esp32ip]);
+
+      async function sendPoseToESP() {
+        setSyncStatus("Sending...");
+        try {
+          const q = anglesRef.current.map((a, j) => `j${j}=${a.toFixed(1)}`).join('&') + `&time=1000`;
+          await fetch(`http://${esp32ip}/set_all?${q}`);
+          setSyncStatus("Pose sent!"); setTimeout(() => setSyncStatus(""), 2000);
+        } catch (e) { setSyncStatus("Network Error. Check IP."); }
+      }
+
+      async function uploadPathToESP() {
+        if (!esp32ip) return alert("Enter ESP32 IP");
+        setSyncStatus("Clearing path...");
+        try {
+          await fetch(`http://${esp32ip}/clear_path`);
+          for (let i = 0; i < waypoints.length; i++) {
+            setSyncStatus(`Uploading wp ${i+1}/${waypoints.length}...`);
+            const wp = waypoints[i];
+            const time = Math.round(1000 / wp.speed);
+            const q = wp.angles.map((a, j) => `j${j}=${a.toFixed(1)}`).join('&') + `&time=${time}`;
+            await fetch(`http://${esp32ip}/add_wp?${q}`);
+          }
+          setSyncStatus("Path uploaded successfully!"); setTimeout(() => setSyncStatus(""), 3000);
+        } catch (e) { setSyncStatus("Network Error. Check IP."); }
+      }
+
+      function saveCurrentPath(name) {
+        const pathData = { id: Date.now(), name: name || `Path ${savedPaths.length + 1}`, created: new Date().toLocaleString(), waypoints: [...waypoints] };
+        const updated = [...savedPaths, pathData];
+        setSavedPaths(updated);
+        localStorage.setItem("robotPaths", JSON.stringify(updated));
+      }
+      function loadPath(id) {
+        const path = savedPaths.find(p => p.id === id);
+        if (path && path.waypoints) {
+          setWaypoints(path.waypoints.map(wp => ({ ...wp, id: wp.id || Date.now() + Math.random() })));
+          if (path.waypoints[0]) setAngles(path.waypoints[0].angles);
+        }
+      }
+      function deleteSavedPath(id) {
+        if (!window.confirm("Delete this saved path?")) return;
+        const updated = savedPaths.filter(p => p.id !== id);
+        setSavedPaths(updated);
+        localStorage.setItem("robotPaths", JSON.stringify(updated));
+      }
+      function renameSavedPath(id, newName) {
+        const updated = savedPaths.map(p => p.id === id ? { ...p, name: newName } : p);
+        setSavedPaths(updated);
+        localStorage.setItem("robotPaths", JSON.stringify(updated));
+        setEditingPathId(null);
+      }
+      function overwriteSavedPath(id) {
+        if (!window.confirm("Overwrite this saved path with current waypoints?")) return;
+        const updated = savedPaths.map(p => p.id === id ? { ...p, waypoints: [...waypoints], created: new Date().toLocaleString() } : p);
+        setSavedPaths(updated);
+        localStorage.setItem("robotPaths", JSON.stringify(updated));
+      }
+
+      
+      // ── AND LOGIC SENSOR AUTOMATION ────────────────────────────
+      useEffect(() => {
+        const interval = setInterval(async () => {
+          try {
+            const res = await fetch(`http://${esp32ip}/sensor_full_status`);
+            const data = await res.json();
+            setSensorEnabled(data.auto === 1);
+            setUsTrigger(data.us === 1);
+            setIndTrigger(data.ind === 1);
+            setBothTrigger(data.both === 1);
+            setUltrasonicDist(data.dist);
+          } catch (e) {}
+        }, 400);
+        return () => clearInterval(interval);
+      }, [esp32ip]);
+
+      async function startSensorAuto() {
+        setSyncStatus("Uploading paths...");
+        try {
+          await fetch(`http://${esp32ip}/clear_sensor_metal`);
+          for (let i = 0; i < metalPath.length; i++) {
+            const wp = metalPath[i];
+            const time = Math.round(1000 / wp.speed);
+            const q = wp.angles.map((a, j) => `j${j}=${a.toFixed(1)}`).join('&') + `&time=${time}`;
+            await fetch(`http://${esp32ip}/add_sensor_metal_wp?${q}`);
+          }
+          await fetch(`http://${esp32ip}/clear_sensor_nometal`);
+          for (let i = 0; i < noMetalPath.length; i++) {
+            const wp = noMetalPath[i];
+            const time = Math.round(1000 / wp.speed);
+            const q = wp.angles.map((a, j) => `j${j}=${a.toFixed(1)}`).join('&') + `&time=${time}`;
+            await fetch(`http://${esp32ip}/add_sensor_nometal_wp?${q}`);
+          }
+          await fetch(`http://${esp32ip}/sensor_start`);
+          setSyncStatus("✅ AND logic STARTED!");
+          setTimeout(() => setSyncStatus(""), 2000);
+        } catch (e) {
+          setSyncStatus("❌ Error: " + e.message);
+        }
+      }
+
+      async function stopSensorAuto() {
+        try {
+          await fetch(`http://${esp32ip}/sensor_stop`);
+          setSyncStatus("⏹ Stopped");
+          setTimeout(() => setSyncStatus(""), 2000);
+        } catch (e) {
+          setSyncStatus("❌ Error");
+        }
+      }
+
+      function copyPathToSensor(sourcePath, setTargetPath) {
+        if (sourcePath.length === 0) { alert("Source path is empty!"); return; }
+        setTargetPath(sourcePath.map(wp => ({...wp, id: Date.now() + Math.random()})));
+      }
+
+      function renderSensorPathEditor(path, setPath, title, color) {
+        return (
+          <>
+            <Sec color={color}>{title}</Sec>
+            <div style={{ fontSize: 9, color: C.dim, marginBottom: 10 }}>
+              This path runs when BOTH sensors trigger AND material matches. Add ≥2 waypoints.
+            </div>
+            <Btn onClick={() => setPath(w => [...w, { id: Date.now(), label: `S${path.length+1}`, angles: [...angles], ee: { x:+currentEE.x.toFixed(2), y:+currentEE.y.toFixed(2), z:+currentEE.z.toFixed(2) }, speed: 1.5 }])} color={color}>
+              + Add Current Pose
+            </Btn>
+            <div style={{ height: 8 }}/>
+            <Btn onClick={() => { if(window.confirm(`Clear ${path.length} waypoints?`)) setPath([]); }} color={C.danger}>
+              🗑 Clear Path
+            </Btn>
+            <div style={{ height: 10 }}/>
+            {path.map((wp,i)=>(
+              <div key={wp.id} style={{ marginBottom:8, background:C.card, borderRadius:7, border:`1px solid ${color}44`, overflow:"hidden" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 8px", background:`${color}11`, borderBottom:`1px solid ${color}33` }}>
+                  <span style={{ color, fontWeight:"bold", fontSize:12, minWidth:16 }}>{i+1}</span>
+                  <input value={wp.label} onChange={e=>setPath(w=>w.map(p=>p.id===wp.id?{...p,label:e.target.value}:p))} 
+                    style={{ ...INP, flex:1, padding:"2px 6px", fontSize:10, background:"transparent", border:"none", borderBottom:`1px solid ${color}33` }}/>
+                  <button onClick={() => setPath(w => { const n=[...w], i=n.findIndex(x=>x.id===wp.id); if(i>0)[n[i],n[i-1]]=[n[i-1],n[i]]; return n; })} 
+                    style={{ background:"none", border:"none", color:C.dim, cursor:"pointer", fontSize:12 }}>↑</button>
+                  <button onClick={() => setPath(w => { const n=[...w], i=n.findIndex(x=>x.id===wp.id); if(i<n.length-1)[n[i],n[i+1]]=[n[i+1],n[i]]; return n; })} 
+                    style={{ background:"none", border:"none", color:C.dim, cursor:"pointer", fontSize:12 }}>↓</button>
+                  <button onClick={() => setAngles(wp.angles)} 
+                    style={{ background:"none", border:"none", color:C.accent, cursor:"pointer", fontSize:12 }}>▶</button>
+                  <button onClick={() => setPath(w=>w.filter(p=>p.id!==wp.id))} 
+                    style={{ background:"none", border:"none", color:C.danger, cursor:"pointer", fontSize:12 }}>×</button>
+                </div>
+                <div style={{ padding:"6px 8px" }}>
+                  <div style={{ fontSize:9, color:C.dim, marginBottom:5 }}>EE: ({wp.ee.x}, {wp.ee.y}, {wp.ee.z}) cm</div>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:5 }}>
+                    <span style={{ fontSize:9, color:C.dim, whiteSpace:"nowrap" }}>Speed x</span>
+                    <input type="range" min={0.1} max={5} step={0.1} value={wp.speed} 
+                      onChange={e=>setPath(w=>w.map(p=>p.id===wp.id?{...p,speed:+e.target.value}:p))} 
+                      style={{ flex:1, accentColor:color }}/>
+                    <span style={{ color, fontSize:10, minWidth:22 }}>{wp.speed.toFixed(1)}</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </>
+        );
+      }
+
+      const renderSensor = () => {
+        let statusBox, statusText;
+        if (!sensorEnabled) {
+          statusBox = { bg: "#21262d33", border: "#30363d", color: "#8b949e" };
+          statusText = "⏸ Auto OFF";
+        } else if (usTrigger && indTrigger) {
+          statusBox = { bg: "#23863633", border: "#238636", color: "#3fb950" };
+          statusText = "🟡 METAL OBJECT! Running metal path...";
+        } else if (usTrigger && !indTrigger) {
+          statusBox = { bg: "#d2992233", border: "#d29922", color: "#d29922" };
+          statusText = "⚪ NON-METAL OBJECT! Running non-metal path...";
+        } else if (!usTrigger && indTrigger) {
+          statusBox = { bg: "#d2992233", border: "#d29922", color: "#d29922" };
+          statusText = "🧲 Inductive only (no object detected)";
+        } else {
+          statusBox = { bg: "#1f6feb33", border: "#1f6feb", color: "#58a6ff" };
+          statusText = "🔵 Waiting for object...";
+        }
+
+        return (
+          <>
+            <Sec color={C.success}>🧲 Sensor Sorting System</Sec>
+
+            <Card>
+              <div style={{ 
+                padding: "12px", borderRadius: 8, marginBottom: 12,
+                background: statusBox.bg,
+                border: `1px solid ${statusBox.border}`,
+                textAlign: "center"
+              }}>
+                <div style={{ fontSize: 18, marginBottom: 4, fontWeight: "bold", color: statusBox.color }}>
+                  {statusText}
+                </div>
+                <div style={{ fontSize: 10, color: C.dim }}>
+                  US: {ultrasonicDist.toFixed(1)} cm | IND: {indTrigger ? "METAL" : "none"} | BOTH: {bothTrigger ? "YES" : "NO"}
+                </div>
+              </div>
+
+              {/* Sensor indicator bars */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <div style={{ flex: 1, padding: "8px", borderRadius: 6, textAlign: "center",
+                  background: usTrigger ? "#1f6feb33" : "#0d1117",
+                  border: `1px solid ${usTrigger ? "#1f6feb" : "#30363d"}`
+                }}>
+                  <div style={{ fontSize: 16, marginBottom: 2 }}>📡</div>
+                  <div style={{ fontSize: 10, color: usTrigger ? "#58a6ff" : "#8b949e", fontWeight: "bold" }}>
+                    Ultrasonic
+                  </div>
+                  <div style={{ fontSize: 9, color: C.dim }}>{usTrigger ? "✅ TRIGGERED" : "❌ None"}</div>
+                </div>
+                <div style={{ flex: 1, padding: "8px", borderRadius: 6, textAlign: "center",
+                  background: indTrigger ? "#d2992233" : "#0d1117",
+                  border: `1px solid ${indTrigger ? "#d29922" : "#30363d"}`
+                }}>
+                  <div style={{ fontSize: 16, marginBottom: 2 }}>🧲</div>
+                  <div style={{ fontSize: 10, color: indTrigger ? "#d29922" : "#8b949e", fontWeight: "bold" }}>
+                    Inductive
+                  </div>
+                  <div style={{ fontSize: 9, color: C.dim }}>{indTrigger ? "✅ METAL" : "❌ None"}</div>
+                </div>
+                <div style={{ flex: 1, padding: "8px", borderRadius: 6, textAlign: "center",
+                  background: bothTrigger ? "#23863633" : (usTrigger ? "#d2992233" : "#0d1117"),
+                  border: `1px solid ${bothTrigger ? "#238636" : (usTrigger ? "#d29922" : "#30363d")}`
+                }}>
+                  <div style={{ fontSize: 16, marginBottom: 2 }}>⚡</div>
+                  <div style={{ fontSize: 10, color: bothTrigger ? "#3fb950" : (usTrigger ? "#d29922" : "#8b949e"), fontWeight: "bold" }}>
+                    Sort Result
+                  </div>
+                  <div style={{ fontSize: 9, color: C.dim }}>{bothTrigger ? "✅ METAL" : (usTrigger ? "⚪ NON-METAL" : "❌ Waiting")}</div>
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                <Btn onClick={startSensorAuto} color={sensorEnabled ? C.success : C.accent} style={{ flex: 1 }}>
+                  {sensorEnabled ? "✅ Running" : "▶ Start Auto"}
+                </Btn>
+                <Btn onClick={stopSensorAuto} color={C.danger} style={{ flex: 1 }}>
+                  ⏹ Stop Auto
+                </Btn>
+              </div>
+
+              <div style={{ fontSize: 9, color: C.dim, lineHeight: 1.6, background: "#0a1320", padding: "8px", borderRadius: 5 }}>
+                <b>Sorting Logic:</b> Ultrasonic detects any object first.<br/>
+                • US detects + IND detects metal → <b style={{color:"#3fb950"}}>Metal Path</b><br/>
+                • US detects + IND does NOT detect → <b style={{color:"#d29922"}}>Non-Metal Path</b><br/>
+                • Only IND triggers → <b style={{color:"#8b949e"}}>NO ACTION</b> (no object confirmed)<br/>
+                • Each new object runs the appropriate path <b>ONCE</b>.
+              </div>
+            </Card>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 14 }}>
+              {[["control","⚡ Control"],["metal","🟢 Metal"],["nometal","🔴 Non-Metal"]].map(([id,label])=>{
+                const colors = { control: C.accent, metal: "#3fb950", nometal: "#f85149" };
+                return (
+                  <button key={id} onClick={()=>setSensorTab(id)} style={{
+                    padding:"6px 0", fontSize:10, border:`1px solid ${sensorTab===id?colors[id]:C.border}`,
+                    borderRadius:5, cursor:"pointer", background:sensorTab===id?`${colors[id]}33`:"transparent",
+                    color:sensorTab===id?colors[id]:C.dim, fontFamily:"monospace", fontWeight:"bold"
+                  }}>{label}</button>
+                );
+              })}
+            </div>
+
+            {sensorTab === "control" && (
+              <>
+                <Sec color={C.accent}>Quick Setup</Sec>
+                <Card>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <Btn onClick={() => copyPathToSensor(waypoints, setMetalPath)} color="#3fb950">
+                      📋 Current Path → Metal Path
+                    </Btn>
+                    <Btn onClick={() => copyPathToSensor(waypoints, setNoMetalPath)} color="#f85149">
+                      📋 Current Path → Non-Metal Path
+                    </Btn>
+                    <div style={{ borderTop: `1px solid ${C.border}`, marginTop: 4, paddingTop: 8 }}>
+                      <Btn onClick={() => { setMetalPath([]); setNoMetalPath([]); }} color={C.dim}>
+                        🗑 Clear Both Paths
+                      </Btn>
+                    </div>
+                  </div>
+                </Card>
+
+                <Sec color={C.gold}>System Status</Sec>
+                <Card>
+                  <Row l="Metal Path WP" v={`${metalPath.length}`} vc="#3fb950"/>
+                  <Row l="Non-Metal Path WP" v={`${noMetalPath.length}`} vc="#f85149"/>
+                  <Row l="Ultrasonic Range" v="3 - 40 cm" vc={C.accent}/>
+                  <Row l="Logic Mode" v="Sort: US → IND check" vc={C.success}/>
+                  <Row l="Ready to run" v={(metalPath.length>=2 && noMetalPath.length>=2) ? "✅ YES" : "❌ Need ≥2 WP each"} 
+                    vc={(metalPath.length>=2 && noMetalPath.length>=2) ? C.success : C.danger}/>
+                </Card>
+              </>
+            )}
+
+            {sensorTab === "metal" && renderSensorPathEditor(metalPath, setMetalPath, "🟢 Metal Object Path (BOTH trigger)", "#3fb950")}
+            {sensorTab === "nometal" && renderSensorPathEditor(noMetalPath, setNoMetalPath, "🔴 Non-Metal Object Path (BOTH trigger)", "#f85149")}
+          </>
+        );
+      };
+
+      const renderDH = () => (
+        <>
+          <Sec>DH Parameter Table</Sec>
+          <div style={{ fontSize:9.5, color:C.dim, marginBottom:10, lineHeight:1.6 }}>&#128994; confirmed &nbsp;&#9898; assumed default</div>
+          <div style={{ display:"grid", gridTemplateColumns:"18px 70px 70px 70px 65px", gap:4, fontSize:9, color:C.dimmer, marginBottom:5 }}>
+            <span>i</span><span>d (cm)</span><span>a (cm)</span><span>&alpha; (deg)</span><span>Joint</span>
+          </div>
+          {params.map((p,i) => (
+            <div key={i} style={{ display:"grid", gridTemplateColumns:"18px 70px 70px 70px 65px", gap:4, marginBottom:7, alignItems:"center" }}>
+              <span style={{ color:LINK_HEX[i], fontSize:11, fontWeight:"bold" }}>{i+1}</span>
+              {["d","a","alpha"].map(k => (
+                <input key={k} type="number" value={p[k]}
+                  onChange={e => setParams(ps=>ps.map((pp,j)=>j===i?{...pp,[k]:parseFloat(e.target.value)||0}:pp))}
+                  style={{ ...INP, padding:"4px 6px", borderColor:p.known[k]?"#166534":C.border, color:p.known[k]?"#4ade80":C.text }}
+                />
+              ))}
+              <span style={{ fontSize:8.5, color:C.dim }}>{p.label}</span>
+            </div>
+          ))}
+        </>
+      );
+
+      const renderFK = () => (
+        <>
+          <Sec>Forward Kinematics</Sec>
+          <div style={{ fontSize:9.5, color:C.dim, marginBottom:10 }}>Sliders are constrained by your hardware MCU limits.</div>
+          {servoCfg.map((s,i) => {
+            const [minK, maxK] = getKinematicLimits(s);
+            const label = params[i]?.label || s.label;
+            return (
+              <div key={i} style={{ marginBottom:14 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                    <div style={{ width:8, height:8, borderRadius:2, background:LINK_HEX[i] }}/>
+                    <span style={{ fontSize:10.5 }}>J{i+1} &mdash; {label}</span>
+                  </div>
+                  <span style={{ fontSize:12, color:"white", fontWeight:"bold" }}>{angles[i].toFixed(1)}&deg;</span>
+                </div>
+                <input type="range" min={minK} max={maxK} step={0.5} value={angles[i]}
+                  onChange={e=>setAngles(a=>a.map((v,j)=>j===i?+e.target.value:v))}
+                  style={{ width:"100%", accentColor:LINK_HEX[i] }}
+                />
+              </div>
+            );
+          })}
+          <Card>
+            <div style={{ fontSize:10, color:C.success, marginBottom:6, fontWeight:"bold" }}>&#128205; End-Effector (wrt base)</div>
+            <Row l="X" v={`${currentEE.x.toFixed(4)} cm`} vc={C.success}/>
+            <Row l="Y" v={`${currentEE.y.toFixed(4)} cm`} vc={C.success}/>
+            <Row l="Z" v={`${currentEE.z.toFixed(4)} cm`} vc={C.success}/>
+          </Card>
+          <div style={{ display:"flex", gap:6, marginBottom:10 }}>
+            <Btn onClick={()=>setAngles(DEFAULT_ANGLES)} color={C.dim} style={{flex:1}}>Reset to Default</Btn>
+            <Btn onClick={() => setWaypoints(w => [...w, { id: Date.now(), label: `Step ${w.length+1}`, angles: [...angles], ee: { x:+currentEE.x.toFixed(2), y:+currentEE.y.toFixed(2), z:+currentEE.z.toFixed(2) }, speed: 1.5 }])} color={C.gold} style={{flex:1}}>+ Add to Path</Btn>
+          </div>
+        </>
+      );
+
+      const renderIK = () => (
+        <>
+          <Sec>Inverse Kinematics</Sec>
+          <div style={{ fontSize:9.5, color:C.dim, marginBottom:10, lineHeight:1.6 }}>Target position wrt base (cm). Solves within your MCU limits.</div>
+          {[{ax:"x",color:"#ff5f5f"},{ax:"y",color:"#00ff9f"},{ax:"z",color:"#00d4ff"}].map(({ax,color})=>(
+            <div key={ax} style={{ marginBottom:10 }}>
+              <div style={{ fontSize:9.5, color:C.dim, marginBottom:3 }}>{ax.toUpperCase()} Target (cm)</div>
+              <input type="number" value={ikTarget[ax]}
+                onChange={e=>{ setIkTarget(t=>({...t,[ax]:e.target.value})); setIkSol(null); setIkErr(null); }}
+                style={{ ...INP, borderColor:color+"55" }}
+              />
+            </div>
+          ))}
+          <Btn onClick={runIK} color={C.accent}>&#9654; Solve IK</Btn>
+          <Card style={{ marginTop:10 }}>
+            <div style={{ fontSize:9, color:C.dim, fontWeight:"bold", marginBottom:6 }}>ACTIVE JOINT LIMITS (from Config)</div>
+            {servoCfg.map((s, i) => {
+              const [minK, maxK] = getKinematicLimits(s);
+              return (
+                <div key={i} style={{ display:"flex", justifyContent:"space-between", fontSize:9, marginBottom:3 }}>
+                  <span style={{ color:LINK_HEX[i] }}>J{i+1} {s.label}</span>
+                  <span style={{ color:C.text, fontFamily:"monospace" }}>{minK.toFixed(0)}° → {maxK.toFixed(0)}°</span>
+                </div>
+              );
+            })}
+          </Card>
+          {ikSol && (
+            <>
+              <Card style={{ marginTop:10 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+                  <span style={{ fontSize:10, color:ikErr<0.5?C.success:C.gold, fontWeight:"bold" }}>{ikErr<0.5?"✅ Converged":"⚠ Approximate"}</span>
+                  <span style={{ fontSize:9, color:C.dim }}>err: {ikErr?.toFixed(3)} cm</span>
+                </div>
+                {ikSol.map((a,i)=><Row key={i} l={`J${i+1}`} v={`${a.toFixed(3)}deg`} vc={LINK_HEX[i]}/>)}
+              </Card>
+              <Btn onClick={() => { setAngles(ikSol); setIkApplied(true); }} color={C.success}>Apply to Arm &rarr;</Btn>
+              {ikApplied && <div style={{ fontSize:9, color:C.success, textAlign:"center", marginTop:5 }}>&#10003; Applied successfully</div>}
+            </>
+          )}
+        </>
+      );
+
+      const renderPath = () => (
+        <>
+          <Sec>Path Planning</Sec>
+          <div style={{ fontSize:9.5, color:C.dim, marginBottom:10, lineHeight:1.6 }}>Add waypoints visually. Interpolates via smoothstep.</div>
+          <Card>
+            <div style={{ display:"flex", gap:6, marginBottom:8 }}>
+              <Btn onClick={()=>{
+                if (waypoints.length<2) return alert("Need at least 2 waypoints");
+                if (!isPlaying) { setPlayIdx(0); setPlayT(0); setTrailPts([]); }
+                setIsPlaying(p=>!p);
+              }} color={isPlaying?C.danger:C.success} style={{ flex:2 }}>{isPlaying?"⏹ Stop":"▶ Play Path"}</Btn>
+              <Btn onClick={()=>{ setIsPlaying(false); setPlayIdx(0); setPlayT(0); setTrailPts([]); if(waypoints[0]) setAngles(waypoints[0].angles); }} color={C.dim} style={{ flex:1 }}>Reset</Btn>
+            </div>
+            <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginBottom:6 }}>
+              <label style={{ color:C.dim, display:"flex", alignItems:"center", gap:5, cursor:"pointer", fontSize:10 }}><input type="checkbox" checked={loopPath} onChange={e=>setLoopPath(e.target.checked)} style={{ accentColor:C.accent }}/> Loop</label>
+              <label style={{ color:C.dim, display:"flex", alignItems:"center", gap:5, cursor:"pointer", fontSize:10 }}><input type="checkbox" checked={showTrail} onChange={e=>setShowTrail(e.target.checked)} style={{ accentColor:C.accent }}/> Trail</label>
+              <button onClick={()=>setTrailPts([])} style={{ background:"none", border:`1px solid ${C.border}`, color:C.dim, borderRadius:4, padding:"2px 7px", fontSize:9, cursor:"pointer" }}>Clear trail</button>
+            </div>
+          </Card>
+          <Btn onClick={() => setWaypoints(w => [...w, { id: Date.now(), label: `Step ${w.length+1}`, angles: [...angles], ee: { x:+currentEE.x.toFixed(2), y:+currentEE.y.toFixed(2), z:+currentEE.z.toFixed(2) }, speed: 1.5 }])} color={C.accent}>+ Add Current Pose as WP</Btn>
+          <div style={{ height:6 }}/>
+          <Btn onClick={() => { if(waypoints.length === 0) return; if(window.confirm(`Remove all ${waypoints.length} waypoint${waypoints.length>1?'s':''}?`)) { setWaypoints([]); setIsPlaying(false); setPlayIdx(0); setPlayT(0); setTrailPts([]); } }} color={C.danger}>🗑 Clear All Waypoints</Btn>
+          <div style={{ height:8 }}/>
+          {waypoints.map((wp,i)=>(
+            <div key={wp.id} style={{ marginBottom:8, background:C.card, borderRadius:7, border:`1px solid ${C.border}`, overflow:"hidden" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 8px", background:"#0a1320", borderBottom:`1px solid ${C.border}` }}>
+                <span style={{ color:C.gold, fontWeight:"bold", fontSize:12, minWidth:16 }}>{i+1}</span>
+                <input value={wp.label} onChange={e=>setWaypoints(w=>w.map(p=>p.id===wp.id?{...p,label:e.target.value}:p))} style={{ ...INP, flex:1, padding:"2px 6px", fontSize:10, background:"transparent", border:"none", borderBottom:`1px solid ${C.border}` }}/>
+                <button onClick={() => setWaypoints(w => { const n=[...w], i=n.findIndex(x=>x.id===wp.id); if(i>0) [n[i],n[i-1]]=[n[i-1],n[i]]; return n; })} style={{ background:"none", border:"none", color:C.dim, cursor:"pointer", fontSize:12 }}>↑</button>
+                <button onClick={() => setWaypoints(w => { const n=[...w], i=n.findIndex(x=>x.id===wp.id); if(i<n.length-1) [n[i],n[i+1]]=[n[i+1],n[i]]; return n; })} style={{ background:"none", border:"none", color:C.dim, cursor:"pointer", fontSize:12 }}>↓</button>
+                <button onClick={() => setAngles(wp.angles)} style={{ background:"none", border:"none", color:C.accent, cursor:"pointer", fontSize:12, marginLeft:4 }}>▶</button>
+                <button onClick={() => setWaypoints(w => w.map(p => p.id===wp.id ? {...p, angles:[...angles], ee:{x:+currentEE.x.toFixed(2),y:+currentEE.y.toFixed(2),z:+currentEE.z.toFixed(2)}} : p))} style={{ background:"none", border:"none", color:C.gold, cursor:"pointer", fontSize:12, marginLeft:4 }}>↺</button>
+                <button onClick={() => setWaypoints(w=>w.filter(p=>p.id!==wp.id))} style={{ background:"none", border:"none", color:C.danger, cursor:"pointer", fontSize:12, marginLeft:4 }}>×</button>
+              </div>
+              <div style={{ padding:"6px 8px" }}>
+                <div style={{ fontSize:9, color:C.dim, marginBottom:5 }}>EE: ({wp.ee.x}, {wp.ee.y}, {wp.ee.z}) cm</div>
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:5 }}>
+                  <span style={{ fontSize:9, color:C.dim, whiteSpace:"nowrap" }}>Speed x</span>
+                  <input type="range" min={0.1} max={5} step={0.1} value={wp.speed} onChange={e=>setWaypoints(w=>w.map(p=>p.id===wp.id?{...p,speed:+e.target.value}:p))} style={{ flex:1, accentColor:C.gold }}/>
+                  <span style={{ color:C.gold, fontSize:10, minWidth:22 }}>{wp.speed.toFixed(1)}</span>
+                </div>
+              </div>
+            </div>
+          ))}
+          <div style={{ height:12 }}/>
+          <Sec color={C.success}>Save &amp; Load Paths</Sec>
+          <Card>
+            <div style={{ display:"flex", gap:6, marginBottom:8 }}>
+              <Btn onClick={() => { const name = prompt("Enter path name:", `Path ${savedPaths.length + 1}`); if (name) saveCurrentPath(name); }} color={C.success}>💾 Save Current Path</Btn>
+              <Btn onClick={() => { if(window.confirm("Clear all saved paths from browser?")) { setSavedPaths([]); localStorage.removeItem("robotPaths"); } }} color={C.danger}>🗑 Clear Saved</Btn>
+            </div>
+            {savedPaths.length === 0 ? (
+              <div style={{ fontSize:9, color:C.dim, textAlign:"center", padding:"8px 0" }}>No saved paths yet.</div>
+            ) : (
+              <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                {savedPaths.map(sp => (
+                  <div key={sp.id} style={{ background:"#0a1320", borderRadius:5, padding:"6px 8px", border:`1px solid ${C.border}`, display:"flex", alignItems:"center", gap:6 }}>
+                    {editingPathId === sp.id ? (
+                      <>
+                        <input value={editPathName} onChange={e=>setEditPathName(e.target.value)} style={{...INP, flex:1, fontSize:10, padding:"3px 6px"}} autoFocus/>
+                        <button onClick={()=>renameSavedPath(sp.id, editPathName)} style={{background:"none",border:"none",color:C.success,cursor:"pointer",fontSize:12}}>✓</button>
+                        <button onClick={()=>setEditingPathId(null)} style={{background:"none",border:"none",color:C.danger,cursor:"pointer",fontSize:12}}>×</button>
+                      </>
+                    ) : (
+                      <>
+                        <span style={{ fontSize:10, color:C.text, flex:1, fontWeight:"bold" }}>{sp.name}</span>
+                        <span style={{ fontSize:8, color:C.dim }}>{sp.waypoints?.length || 0} wp</span>
+                        <button onClick={()=>loadPath(sp.id)} style={{background:"none",border:"none",color:C.accent,cursor:"pointer",fontSize:12}}>▶ Load</button>
+                        <button onClick={()=>overwriteSavedPath(sp.id)} style={{background:"none",border:"none",color:C.gold,cursor:"pointer",fontSize:12}}>↺ Save</button>
+                        <button onClick={()=>{setEditingPathId(sp.id);setEditPathName(sp.name);}} style={{background:"none",border:"none",color:C.dim,cursor:"pointer",fontSize:12}}>✎</button>
+                        <button onClick={()=>deleteSavedPath(sp.id)} style={{background:"none",border:"none",color:C.danger,cursor:"pointer",fontSize:12}}>×</button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+          <div style={{ height:12 }}/>
+          <Sec color={C.gold}>Import Path</Sec>
+          <div style={{ fontSize:9.5, color:C.dim, marginBottom:6 }}>Load a preset shape (IK-solved to your current config):</div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:5, marginBottom:10 }}>
+            {[["circle","⭕ Circle"],["heart","❤ Heart"],["figure8","∞ Figure-8"],["square","⬜ Square"],["spiral","🌀 Spiral"]].map(([key,label])=>(
+              <Btn key={key} onClick={()=>loadPreset(key)} color={C.gold}>{label}</Btn>
+            ))}
+          </div>
+          <Btn onClick={()=>{ setShowImport(v=>!v); setImportError(""); }} color={C.accent}>
+            {showImport ? "▲ Close JSON Import" : "▼ Import from JSON"}
+          </Btn>
+          {showImport && (
+            <div style={{ marginTop:8 }}>
+              <Card style={{ marginBottom:8 }}>
+                <div style={{ fontSize:9, color:C.dim, lineHeight:1.7 }}>
+                  <div style={{ color:C.gold, fontWeight:"bold", marginBottom:4 }}>JSON Formats:</div>
+                  <div style={{ color:C.accent }}>Type "angles" — direct joint control:</div>
+                  <pre style={{ fontSize:8, color:"#6ab0d4", whiteSpace:"pre-wrap", margin:"3px 0 8px" }}>{`{\n  "name": "My Path",\n  "type": "angles",\n  "speed": 1.5,\n  "waypoints": [\n    {"label":"Home","angles":[0,60,-120,60,0]},\n    {"label":"Up",  "angles":[30,45,-90,45,0]}\n  ]\n}`}</pre>
+                  <div style={{ color:C.accent }}>Type "cartesian" — IK auto-solved:</div>
+                  <pre style={{ fontSize:8, color:"#6ab0d4", whiteSpace:"pre-wrap", margin:"3px 0" }}>{`{\n  "name": "My Path",\n  "type": "cartesian",\n  "speed": 1.5,\n  "points": [\n    {"label":"P1","x":15,"y":0, "z":9},\n    {"label":"P2","x":12,"y":5, "z":12}\n  ]\n}`}</pre>
+                </div>
+              </Card>
+              <textarea value={importJSON} onChange={e=>{ setImportJSON(e.target.value); setImportError(""); }}
+                placeholder='Paste JSON path here...'
+                style={{ ...INP, height:120, resize:"vertical", fontSize:9, padding:8, display:"block", marginBottom:6 }}
+              />
+              {importError && <div style={{ fontSize:9, color:C.danger, marginBottom:6, lineHeight:1.5 }}>⚠ {importError}</div>}
+              <Btn onClick={()=>importPath(importJSON, angles)} color={C.success}>✓ Import &amp; Add to Path</Btn>
+              {waypoints.length > 0 && (
+                <>
+                  <div style={{ height:8 }}/>
+                  <Btn onClick={()=>{
+                    const json = JSON.stringify({ name:"My Path", type:"angles", speed:1.5,
+                      waypoints: waypoints.map(wp=>({ label:wp.label, angles:wp.angles.map(a=>+a.toFixed(2)), speed:wp.speed }))
+                    }, null, 2);
+                    navigator.clipboard?.writeText(json).catch(()=>{});
+                    setImportJSON(json);
+                  }} color={C.dim}>📋 Export Current Path as JSON</Btn>
+                </>
+              )}
+            </div>
+          )}
+        </>
+      );
+
+      // ── THE FIX: App's return statement was missing ──
+      return (
+        <div className="app-container">
+          <div className="panel-left">
+            <div style={{ padding:"11px 14px", background:"#070e1a", borderBottom:`1px solid ${C.border}`, flexShrink:0 }}>
+              <div style={{ fontSize:13, fontWeight:"bold", color:C.accent, letterSpacing:"0.07em" }}>🦾 5-DOF ROBOT PLANNER</div>
+            </div>
+            <div style={{ padding:"5px 14px", background:"#060d1a", borderBottom:`1px solid ${C.border}`, display:"flex", gap:10, fontSize:9.5, alignItems:"center", flexShrink:0 }}>
+              {["x","y","z"].map(ax => (
+                <span key={ax}>
+                  <span style={{ color:C.dim }}>{ax.toUpperCase()} </span>
+                  <span style={{ color:C.success, fontWeight:"bold" }}>{currentEE[ax].toFixed(2)}</span>
+                </span>
+              ))}
+            </div>
+            <div style={{ display:"flex", borderBottom:`1px solid ${C.border}`, background:"#060d1a", flexShrink:0 }}>
+              {[{id:"dh",l:"DH"},{id:"fk",l:"FK"},{id:"ik",l:"IK"},{id:"path",l:"PATH"},{id:"sensor",l:"SENSOR"},{id:"mcu",l:"MCU"}].map(({id,l}) => (
+                <button key={id} onClick={()=>setTab(id)} style={{
+                  flex:1, padding:"8px 0", fontSize:10, border:"none", cursor:"pointer",
+                  background:tab===id?(id==="mcu"?`${C.mcu}33`:`${C.accent}18`):"transparent",
+                  color:tab===id?(id==="mcu"?C.mcuL:C.accent):C.dim,
+                  borderBottom:tab===id?`2px solid ${id==="mcu"?C.mcuL:C.accent}`:"2px solid transparent",
+                  fontFamily:"monospace", fontWeight:tab===id?"bold":"normal", transition:"all 0.1s"
+                }}>{l}</button>
+              ))}
+            </div>
+            <div style={{ flex:1, overflowY:"auto", padding:"12px 14px 20px" }}>
+              {tab === "dh"   && renderDH()}
+              {tab === "fk"   && renderFK()}
+              {tab === "ik"   && renderIK()}
+              {tab === "path" && renderPath()}
+              {tab === "sensor" && renderSensor()}
+              {tab === "mcu"  && (
+                <>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:4, marginBottom:14 }}>
+                    {[["config","Setup"],["live","Live Control"],["code","Gen. Code"]].map(([id,label])=>(
+                      <button key={id} onClick={()=>setMcuSubTab(id)} style={{
+                        padding:"6px 0", fontSize:10, border:`1px solid ${mcuSubTab===id?C.mcuL:C.border}`,
+                        borderRadius:5, cursor:"pointer", background:mcuSubTab===id?`${C.mcu}44`:"transparent",
+                        color:mcuSubTab===id?C.mcuL:C.dim, fontFamily:"monospace"
+                      }}>{label}</button>
+                    ))}
+                  </div>
+
+                  {mcuSubTab === "live" && (
+                    <>
+                      <Sec color={C.mcuL}>ESP32 Direct Integration</Sec>
+                      <Card>
+                        <div style={{ fontSize:8.5, color:C.dim, marginBottom:3 }}>ESP32 IP Address (Find in Serial Monitor)</div>
+                        <input value={esp32ip} onChange={e=>setEsp32ip(e.target.value)} style={{...INP, fontSize:10, marginBottom:10}} placeholder="192.168.1.xxx" />
+                        <div onClick={()=>setLiveSyncEnabled(v=>!v)} style={{
+                          display:"flex", alignItems:"center", gap:8, cursor:"pointer",
+                          background: liveSyncEnabled ? `${C.success}18` : `${C.dimmer}22`,
+                          border: `1px solid ${liveSyncEnabled ? C.success : C.border}`,
+                          borderRadius:6, padding:"7px 10px", marginBottom:10, transition:"all 0.2s"
+                        }}>
+                          <div style={{ width:28, height:16, borderRadius:8, background: liveSyncEnabled ? C.success : C.dimmer, position:"relative", transition:"background 0.2s", flexShrink:0 }}>
+                            <div style={{ position:"absolute", top:2, left: liveSyncEnabled ? 14 : 2, width:12, height:12, borderRadius:6, background:"white", transition:"left 0.2s" }}/>
+                          </div>
+                          <div>
+                            <div style={{fontSize:10, fontWeight:"bold", color: liveSyncEnabled ? C.success : C.dim}}>{liveSyncEnabled ? "🔴 Live Sync ON" : "⚪ Live Sync OFF"}</div>
+                            <div style={{fontSize:8.5, color:C.dim}}>{liveSyncEnabled ? "FK/IK changes auto-send to ESP32" : "Enable to stream pose changes live"}</div>
+                          </div>
+                        </div>
+                        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:6, marginBottom:6 }}>
+                          <Btn onClick={sendPoseToESP} color={C.accent}>📡 Send Pose</Btn>
+                          <Btn onClick={uploadPathToESP} color={C.gold}>📤 Upload Path</Btn>
+                          <Btn onClick={()=>fetch(`http://${esp32ip}/run`).catch(()=>setSyncStatus("Err"))} color={C.success}>▶ Run ESP Path</Btn>
+                          <Btn onClick={()=>fetch(`http://${esp32ip}/stop`).catch(()=>setSyncStatus("Err"))} color={C.danger}>⏹ Stop</Btn>
+                        </div>
+                        {syncStatus && <div style={{fontSize:10, color:C.success, textAlign:"center", marginTop:4, fontWeight:"bold"}}>{syncStatus}</div>}
+                      </Card>
+                      <Sec color={C.mcuL}>Joint Control</Sec>
+                      <Card>
+                        {servoCfg.map((s, i) => {
+                          const [minK, maxK] = getKinematicLimits(s);
+                          const label = params[i]?.label || s.label;
+                          return (
+                            <div key={i} style={{ marginBottom: i < servoCfg.length-1 ? 12 : 0 }}>
+                              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:2 }}>
+                                <div style={{ display:"flex", alignItems:"center", gap:5 }}>
+                                  <div style={{ width:7, height:7, borderRadius:2, background:LINK_HEX[i] }}/>
+                                  <span style={{ fontSize:10, color:LINK_HEX[i] }}>J{i+1} — {label}</span>
+                                </div>
+                                <span style={{ fontSize:11, color:"white", fontWeight:"bold" }}>{angles[i].toFixed(1)}°</span>
+                              </div>
+                              <input type="range" min={minK} max={maxK} step={0.5} value={angles[i]}
+                                onChange={e => setAngles(a => a.map((v,j) => j===i ? +e.target.value : v))}
+                                style={{ width:"100%", accentColor:LINK_HEX[i] }}
+                              />
+                            </div>
+                          );
+                        })}
+                        <div style={{ display:"flex", gap:6, marginTop:10 }}>
+                          <Btn onClick={()=>setAngles(DEFAULT_ANGLES)} color={C.dim} style={{flex:1}}>Reset</Btn>
+                        </div>
+                      </Card>
+                      <Sec color={C.mcuL}>Live End-Effector Position</Sec>
+                      <Card>
+                        <div style={{ fontSize:10, color:C.success, marginBottom:6, fontWeight:"bold" }}>&#128205; EE Position (wrt base)</div>
+                        <Row l="X" v={`${currentEE.x.toFixed(2)} cm`} vc={C.success}/>
+                        <Row l="Y" v={`${currentEE.y.toFixed(2)} cm`} vc={C.success}/>
+                        <Row l="Z" v={`${currentEE.z.toFixed(2)} cm`} vc={C.success}/>
+                        <div style={{ marginTop:8, paddingTop:8, borderTop:`1px solid ${C.border}`, fontSize:9, color:C.dim, lineHeight:1.6 }}>
+                          Updates live as you move sliders above. Send pose when ready.
+                        </div>
+                      </Card>
+                      <Sec color={C.mcuL}>Embedded Interface</Sec>
+                      <div style={{ fontSize:9.5, color:C.dim, marginBottom:10, lineHeight:1.6 }}>Directly loading the web server hosted by your ESP32 below:</div>
+                      <div style={{ border:`1px solid ${C.border}`, borderRadius:6, overflow:"hidden", background:"#0a1320" }}>
+                        <iframe src={`http://${esp32ip}/`} style={{ width:"100%", height:400, border:"none" }} title="ESP32 Web UI"/>
+                      </div>
+                    </>
+                  )}
+
+                  {mcuSubTab === "config" && (
+                    <>
+                      <Sec color={C.mcuL}>Wi-Fi &amp; PCA9685</Sec>
+                      <Card>
+                        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:6, marginBottom:6 }}>
+                          <div><div style={{fontSize:8.5, color:C.dim, marginBottom:3}}>SSID</div><input value={mcuCfg.ssid} onChange={e=>setMcuCfg(c=>({...c,ssid:e.target.value}))} style={{...INP, fontSize:10}}/></div>
+                          <div><div style={{fontSize:8.5, color:C.dim, marginBottom:3}}>Password</div><input value={mcuCfg.password} onChange={e=>setMcuCfg(c=>({...c,password:e.target.value}))} style={{...INP, fontSize:10}}/></div>
+                        </div>
+                      </Card>
+                      <Sec color={C.mcuL}>Hardware Joint Constraints</Sec>
+                      {servoCfg.map((s,i)=>(
+                        <div key={i} style={{ marginBottom:10, background:C.card, borderRadius:7, border:`1px solid ${C.border}`, overflow:"hidden" }}>
+                          <div style={{ display:"flex", alignItems:"center", gap:8, padding:"6px 10px", background:"#0a1320", borderBottom:`1px solid ${C.border}` }}>
+                            <div style={{ width:8, height:8, borderRadius:2, background:LINK_HEX[i] }}/>
+                            <span style={{ fontSize:10.5, color:LINK_HEX[i], fontWeight:"bold" }}>J{i+1} &mdash; {s.label}</span>
+                          </div>
+                          <div style={{ padding:"8px 10px", display:"flex", flexDirection:"column", gap:8 }}>
+                            <div style={{ display:"flex", gap:10 }}>
+                              <div style={{flex:1}}>
+                                <div style={{fontSize:8.5, color:C.dim, marginBottom:2}}>PCA Channel</div>
+                                <input type="number" value={s.channel} onChange={e=>setServoCfg(c=>c.map((sc,idx)=>idx===i?{...sc,channel:+e.target.value}:sc))} style={{...INP, fontSize:10}}/>
+                              </div>
+                              <label style={{ flex:1, display:"flex", alignItems:"flex-end", paddingBottom:4, gap:7, fontSize:10, color:C.dim, cursor:"pointer" }}>
+                                <input type="checkbox" checked={s.reversed} onChange={e=>setServoCfg(c=>c.map((sc,idx)=>idx===i?{...sc,reversed:e.target.checked}:sc))} style={{accentColor:C.mcuL}}/> Reversed
+                              </label>
+                            </div>
+                            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:6 }}>
+                              <div><div style={{fontSize:8.5, color:C.dim, marginBottom:2}}>Zero Pt</div><input type="number" value={s.zero} onChange={e=>setServoCfg(c=>c.map((sc,idx)=>idx===i?{...sc,zero:+e.target.value}:sc))} style={{...INP, fontSize:10}}/></div>
+                              <div><div style={{fontSize:8.5, color:C.dim, marginBottom:2}}>Min(°)</div><input type="number" value={s.min} onChange={e=>setServoCfg(c=>c.map((sc,idx)=>idx===i?{...sc,min:+e.target.value}:sc))} style={{...INP, fontSize:10}}/></div>
+                              <div><div style={{fontSize:8.5, color:C.dim, marginBottom:2}}>Max(°)</div><input type="number" value={s.max} onChange={e=>setServoCfg(c=>c.map((sc,idx)=>idx===i?{...sc,max:+e.target.value}:sc))} style={{...INP, fontSize:10}}/></div>
+                              <div><div style={{fontSize:8.5, color:C.dim, marginBottom:2}}>Trim</div><input type="number" value={s.trim} onChange={e=>setServoCfg(c=>c.map((sc,idx)=>idx===i?{...sc,trim:+e.target.value}:sc))} style={{...INP, fontSize:10}}/></div>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </>
+                  )}
+
+                  {mcuSubTab === "code" && (
+                    <>
+                      <Sec color={C.mcuL}>Dynamic ESP32 Sketch</Sec>
+                      <div style={{ fontSize:9.5, color:C.dim, marginBottom:8, lineHeight:1.5 }}>
+                        Upload this code <b>ONCE</b>. It supports receiving dynamic updates from the Live tab via HTTP endpoints.
+                      </div>
+                      <Btn onClick={copyCode} color={copied?C.success:C.mcuL}>{copied?"✅ Copied!":"📋 Copy to Clipboard"}</Btn>
+                      <div style={{ background:"#030609", border:`1px solid ${C.mcu}55`, borderRadius:6, padding:"10px", marginTop:10, fontSize:9, color:"#8baac0", maxHeight:400, overflowY:"auto", whiteSpace:"pre-wrap", wordBreak:"break-word" }}>
+                        {generateCode(waypoints, servoCfg, loopPath, mcuCfg, DEFAULT_ANGLES)}
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="panel-right">
+            <canvas ref={canvasRef} style={{ width:"100%", height:"100%", display:"block" }} />
+            <div style={{ position:"absolute", top:10, left:10, display:"flex", flexDirection:"column", gap:5 }}>
+              {["FRONT","SIDE","TOP","HOME"].map(preset => (
+                <button key={preset} onClick={() => setCameraView(preset)} style={{
+                  background:"rgba(7,11,20,0.85)", border:`1px solid ${C.border}`,
+                  color:C.dim, borderRadius:5, padding:"5px 9px", fontSize:9.5, cursor:"pointer",
+                  fontFamily:"monospace", fontWeight:"bold", backdropFilter:"blur(5px)", width:60
+                }}>{preset}</button>
+              ))}
+            </div>
+            <div style={{ position:"absolute", top:10, right:12, background:"rgba(7,11,20,0.85)", borderRadius:7, padding:"8px 12px", fontSize:9.5, color:C.dim, border:`1px solid ${C.border}` }}>
+              <div style={{ color:C.accent, fontWeight:"bold", marginBottom:2 }}>VIEWPORT</div>
+              <div>🖱 Left Drag: Orbit</div>
+              <div>🖱 Right Drag: Pan</div>
+              <div>🖱 Scroll: Zoom</div>
+            </div>
+            <div style={{ position:"absolute", bottom:12, left:12, background:"rgba(7,11,20,0.85)", borderRadius:7, padding:"9px 13px", border:`1px solid ${C.border}` }}>
+              <div style={{ color:C.dim, fontWeight:"bold", marginBottom:8, fontSize:10 }}>DH AXES (RGB)</div>
+              {[{label:"X",color:"#ff0000",desc:"Red / Right"},{label:"Y",color:"#00ff00",desc:"Green / Forward"},{label:"Z",color:"#0000ff",desc:"Blue / Up"}].map(({label,color,desc})=>(
+                <div key={label} style={{ display:"flex", alignItems:"center", gap:8, marginBottom:3 }}>
+                  <span style={{ color, fontWeight:"bold", minWidth:10, fontSize:10.5 }}>{label}</span>
+                  <span style={{ color:C.dim, fontSize:9 }}>{desc}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App/>);
+  </script>
+</body>
+</html>
