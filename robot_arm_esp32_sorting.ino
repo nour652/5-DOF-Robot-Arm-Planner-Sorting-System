@@ -12,8 +12,8 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
-const char* ssid     = "Nour eldeen’s iPhone";
-const char* password = "123456789";
+const char* ssid     = "ssid";
+const char* password = "password";
 WebServer server(80);
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
