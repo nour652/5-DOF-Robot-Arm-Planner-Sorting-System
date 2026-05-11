@@ -83,6 +83,212 @@ This project provides a complete pipeline for programming, simulating, and physi
 
 ---
 
+## Simulation Tabs Explained
+
+The browser planner (`robot_arm_planner_sorting.html`) is organized into six tabs. Each tab controls a different aspect of the robot arm.
+
+### DH — Denavit-Hartenberg Parameters
+
+This tab displays and edits the kinematic model of the arm.
+
+| Column | Meaning | What to change |
+|---|---|---|
+| **d** | Link offset along previous Z axis (cm) | Measure the vertical distance between joint axes |
+| **a** | Link length — distance between Z axes (cm) | Measure the horizontal distance between joints |
+| **α** | Twist angle between Z axes (degrees) | Usually 0° or 90° based on joint orientation |
+
+**How to use:**
+- Green-bordered cells indicate confirmed physical measurements.
+- Edit any value and the 3D arm updates instantly.
+- These parameters define how the FK and IK solvers calculate positions.
+- If your physical arm has different link lengths, measure them and update here before using IK.
+
+**Tip:** The default values (d=8.5, a=10, a=12.5, d=11) match a typical 5-DOF desktop arm. If your arm is bigger or smaller, scale all `a` and `d` values proportionally.
+
+---
+
+### FK — Forward Kinematics
+
+This tab gives you direct joint control with live 3D visualization.
+
+**What you see:**
+- Six sliders (J1–J6), each constrained by the hardware limits you set in **MCU → Setup**.
+- Real-time end-effector position (X, Y, Z) in centimetres.
+- The 3D model updates instantly as you drag sliders.
+
+**How to use:**
+- Drag any slider to move that joint.
+- J1 (Base Yaw) rotates the entire arm left/right.
+- J2 (Shoulder) and J3 (Elbow) control the main arm reach.
+- J4 (Wrist Pitch) angles the wrist up/down.
+- J5 (Wrist Roll) rotates the wrist.
+- J6 (Gripper) opens/closes the gripper fingers.
+- Click **Reset to Default** to return to the home pose `[0, 60, -120, 60, 0, 0]`.
+- Click **+ Add to Path** to save the current pose as a waypoint.
+
+**Tip:** The gripper (J6) does not affect the end-effector position in the FK calculation — it only controls the fingers. This is correct because opening/closing a gripper doesn't move the arm's tip.
+
+---
+
+### IK — Inverse Kinematics
+
+This tab lets you specify a target position in space, and the solver finds the joint angles to reach it.
+
+**What you see:**
+- Three input fields: **X Target**, **Y Target**, **Z Target** (in cm, relative to base).
+- A **Solve IK** button that runs the numerical solver.
+- Active joint limits from your servo configuration.
+
+**How to use:**
+1. Enter a target position, e.g. `X=15`, `Y=0`, `Z=9`.
+2. Click **▶ Solve IK**.
+3. The solver runs up to 600 iterations. If it converges, you see:
+   - **✅ Converged** — error < 0.5 cm
+   - **⚠ Approximate** — error > 0.5 cm (target may be near workspace edge)
+4. Review the solved angles for each joint.
+5. Click **Apply to Arm →** to move the simulation to that pose.
+6. From the **FK** tab, click **+ Add to Path** to save it.
+
+**How the solver works:**
+- Uses Jacobian-based damped least squares (`λ = 0.5`).
+- Perturbs each joint by `ε = 0.4°` to build the Jacobian numerically.
+- Clamps every update to your hardware joint limits.
+- Stops when position error is < 0.04 cm or max iterations reached.
+
+**Tip:** If IK fails repeatedly, check that your target is within reach. The workspace is roughly a hemisphere in front of the base with radius ~30 cm. Also verify your DH parameters match your physical arm.
+
+---
+
+### PATH — Path Planning
+
+This tab is where you build, preview, and manage multi-waypoint motion sequences.
+
+**What you see:**
+- Playback controls: **▶ Play Path**, **⏹ Stop**, **Reset**.
+- Loop and Trail checkboxes.
+- A list of all waypoints with drag-to-reorder, edit labels, adjust speed.
+- Import/Export JSON, preset shapes, and saved path management.
+
+**How to build a path:**
+1. Use **FK** or **IK** to position the arm.
+2. Click **+ Add Current Pose as WP** (or the **+ Add to Path** button in FK).
+3. Repeat for each position you want in the sequence.
+4. Click **▶ Play Path** to animate the 3D model through all waypoints.
+5. Adjust each waypoint's speed with the slider (0.1× to 5×).
+6. Enable **Loop** to make the path repeat continuously.
+7. Enable **Trail** to see the end-effector trajectory drawn in 3D.
+
+**Waypoint controls:**
+| Button | Action |
+|---|---|
+| ↑ / ↓ | Reorder waypoint |
+| ▶ | Load this waypoint's angles into the simulation |
+| ↺ | Update this waypoint to the current simulation pose |
+| × | Delete waypoint |
+
+**Presets (auto-solved):**
+- **⭕ Circle**, **❤ Heart**, **∞ Figure-8**, **⬜ Square**, **🌀 Spiral**
+- Click any preset to auto-generate a cartesian path, solve IK for each point, and add to your path.
+
+**Import / Export:**
+- Paste a JSON path (angles or cartesian) into the **Import from JSON** textarea and click **Import**.
+- Click **Export Current Path as JSON** to copy your path as JSON to the clipboard.
+
+**Save & Load:**
+- Click **💾 Save Current Path** to store the path in your browser's LocalStorage.
+- Saved paths persist across page reloads.
+- Click **▶ Load** to restore a saved path, **↺ Save** to overwrite, **×** to delete.
+
+---
+
+### SENSOR — Sensor Sorting System
+
+This tab configures and monitors the autonomous sorting behavior.
+
+**What you see:**
+- Live sensor status: Ultrasonic distance, Inductive metal detection, combined result.
+- Color-coded status box showing the current automation state.
+- Three sub-tabs: **Control**, **Metal**, **Non-Metal**.
+
+**How it works:**
+1. The ultrasonic sensor detects any object within range (17–19 cm).
+2. The inductive sensor checks if the object is metal.
+3. Based on the combination, one of two paths executes:
+   - **US + IND** → Metal path
+   - **US only** → Non-metal path
+   - **IND only** → No action (no object confirmed)
+
+**Quick Setup:**
+1. Build a path in the **PATH** tab for metal objects.
+2. Click **📋 Current Path → Metal Path** in the SENSOR **Control** tab.
+3. Build a different path for non-metal objects.
+4. Click **📋 Current Path → Non-Metal Path**.
+5. Click **▶ Start Auto** — paths are uploaded to ESP32 and automation begins.
+
+**Sub-tabs:**
+
+| Tab | Purpose |
+|---|---|
+| **⚡ Control** | Quick setup buttons, system status, sensor logic explanation |
+| **🟢 Metal** | Edit the metal-object path directly (add poses, reorder, clear) |
+| **🔴 Non-Metal** | Edit the non-metal path directly |
+
+**Monitoring:**
+- The status box updates every 400 ms by polling `/sensor_full_status` from the ESP32.
+- **🟢 Green** = Metal detected, running metal path
+- **🟡 Yellow** = Non-metal detected, running non-metal path
+- **🔵 Blue** = Waiting for object
+- **⚪ Gray** = Automation off
+
+**Tip:** Each object triggers exactly once thanks to rising-edge detection. The ultrasonic sensor is the primary gate — the inductive sensor alone cannot trigger a path.
+
+---
+
+### MCU — Microcontroller Configuration
+
+This tab connects the simulation to your physical ESP32 and generates firmware code.
+
+**Sub-tabs:**
+
+#### Setup
+Configure hardware parameters:
+- **Wi-Fi SSID / Password** — credentials for the ESP32 to connect to your network.
+- **Servo Configuration** — per-joint settings:
+  - **PCA Channel** (0–15)
+  - **Reversed** (invert direction)
+  - **Zero Point** (servo angle at kinematic 0°)
+  - **Min / Max** (physical travel limits)
+  - **Trim** (calibration offset)
+
+**Important:** These limits are enforced in both the simulation sliders and the ESP32 firmware. Setting wrong limits can damage servos or the arm structure.
+
+#### Live Control
+Direct ESP32 integration:
+- **ESP32 IP Address** — enter the IP from Serial Monitor.
+- **🔴 Live Sync** toggle — when ON, every slider movement in FK is sent to the robot in real time (80 ms debounce).
+- **📡 Send Pose** — one-shot send of current simulation angles to ESP32.
+- **📤 Upload Path** — sends all waypoints to ESP32's path buffer.
+- **▶ Run ESP Path** — tells ESP32 to start executing its stored path.
+- **⏹ Stop** — stops motion immediately.
+- **🔄 Sync from Robot** — reads the ESP32's current joint angles and updates the simulation (useful after sensor automation runs).
+- **Embedded Interface** — loads the ESP32's own web UI in an iframe.
+
+**Workflow:**
+1. Enter ESP32 IP.
+2. Enable **Live Sync** to stream changes.
+3. Or use **Send Pose** for discrete moves.
+4. Upload paths, then run them on the ESP32.
+
+#### Gen. Code
+Generates a complete Arduino sketch based on your current configuration:
+- Includes all servo parameters, waypoints, and Wi-Fi credentials.
+- Click **📋 Copy to Clipboard** to paste into Arduino IDE.
+- Upload this code once, then use the Live Control tab for all dynamic updates.
+
+**Tip:** You only need to generate and upload code once. After that, use the HTTP endpoints (`/set`, `/set_all`, `/add_wp`) to update paths and poses dynamically without reflashing.
+
+---
+
 ## System Architecture
 
 ```
