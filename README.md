@@ -89,6 +89,8 @@ The browser planner (`robot_arm_planner_sorting.html`) is organized into six tab
 
 ### DH — Denavit-Hartenberg Parameters
 
+![Alt text](docs/images/DH.png)
+
 This tab displays and edits the kinematic model of the arm.
 
 | Column | Meaning | What to change |
@@ -108,6 +110,8 @@ This tab displays and edits the kinematic model of the arm.
 ---
 
 ### FK — Forward Kinematics
+
+![Alt text](docs/images/FK.png)
 
 This tab gives you direct joint control with live 3D visualization.
 
@@ -132,6 +136,8 @@ This tab gives you direct joint control with live 3D visualization.
 
 ### IK — Inverse Kinematics
 
+![Alt text](docs/images/IK.png)
+ 
 This tab lets you specify a target position in space, and the solver finds the joint angles to reach it.
 
 **What you see:**
@@ -160,6 +166,10 @@ This tab lets you specify a target position in space, and the solver finds the j
 ---
 
 ### PATH — Path Planning
+
+![Alt text](docs/images/Path.png)
+
+![Alt text](docs/images/Path2.png)
 
 This tab is where you build, preview, and manage multi-waypoint motion sequences.
 
@@ -203,6 +213,8 @@ This tab is where you build, preview, and manage multi-waypoint motion sequences
 
 ### SENSOR — Sensor Sorting System
 
+![Alt text](docs/images/sensor.png)
+
 This tab configures and monitors the autonomous sorting behavior.
 
 **What you see:**
@@ -245,6 +257,8 @@ This tab configures and monitors the autonomous sorting behavior.
 ---
 
 ### MCU — Microcontroller Configuration
+
+![Alt text](docs/images/live_control.png)
 
 This tab connects the simulation to your physical ESP32 and generates firmware code.
 
