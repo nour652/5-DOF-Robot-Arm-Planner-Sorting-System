@@ -738,6 +738,9 @@ The LJ12A3-4-Z/BX has a fixed detection range of approximately 4 mm for ferrous 
     ├── Wi-Fi web server (REST API + embedded HTML)
     └── Sensor-triggered sorting automation
 ```
+## NOTE
+
+The hardware is not fully synchronized with the simulation till now , maybe I will try fixing this soon ISA. 
 
 ---
 
