@@ -49,10 +49,11 @@ This project provides a complete pipeline for programming, simulating, and physi
 ## Features
 ![Alt text](docs/images/lorentz.png)
 
+![Alt text](docs/images/2d_shapes.png)
 
 ![Alt text](docs/images/Robot.png)
 
-![Alt text](docs/images/Nour.png)
+![Alt text](docs/images/HYPERBOLOID-MOBIUS.png)
 
 ![Alt text](docs/images/robot_arm.jpeg)
 
