@@ -1,6 +1,6 @@
 // ================================================================
 // ESP32 + PCA9685 + WiFi Web Server — 5-DOF Arm Planner
-// WITH LJ12A3-4-Z/BX Inductive + HC-SR04 Ultrasonic
+// WITH LJ12A3-4-Z/BX Inductive (TIMED LATCH) + HC-SR04 Ultrasonic
 // SORTING LOGIC: Ultrasonic detects object → Inductive checks material
 //   US + IND (metal)    → Metal path
 //   US only (non-metal) → Non-metal path
@@ -12,8 +12,8 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
-const char* ssid     = "Nour eldeen’s iPhone";
-const char* password = "123456789";
+const char* ssid     = "ssid";
+const char* password = "password";
 WebServer server(80);
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
@@ -23,6 +23,12 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 #define ULTRASONIC_ECHO    19     // GPIO19 - Echo
 #define ULTRASONIC_MIN_CM  17      // Minimum detection distance (cm)
 #define ULTRASONIC_MAX_CM  19    // Maximum detection distance (cm)
+
+// ── INDUCTIVE LATCH CONFIG ────────────────────────────────────
+// When metal is detected, the sensor reading stays "true" for this
+// duration even if the physical object moves away. This gives the arm
+// time to react and prevents missed detections on fast-moving objects.
+#define INDUCTIVE_LATCH_MS 3000   // Latch duration in milliseconds (default 3 sec)
 
 // ── SERVO CONFIG ───────────────────────────────────────────────
 #define SERVOMIN  102
@@ -67,6 +73,10 @@ float lastDistanceCm = 999;
 bool lastUltrasonic = false;
 bool lastInductive = false;
 bool lastBothTriggered = false;
+
+// ── INDUCTIVE LATCH STATE ─────────────────────────────────────
+unsigned long inductiveLatchStartMs = 0;  // When metal was first detected
+bool inductiveLatched = false;            // Is the latch currently active?
 
 uint16_t angleToPulse(int j, float k_deg) {
   float phys = k_deg;
@@ -119,24 +129,84 @@ void initJoints() {
   }
 }
 
-float readUltrasonicCm() {
+// ── ULTRASONIC HELPERS ─────────────────────────────────────────
+// HC-SR04 needs ≥60 ms between readings; we poll at most every
+// US_POLL_MS and return the cached value in between.
+#define US_POLL_MS        80      // minimum ms between sensor reads
+#define US_SAMPLES         3      // median filter sample count
+#define US_SAMPLE_GAP_MS  10      // gap between samples in one burst
+
+static unsigned long _usLastReadMs = 0;
+static float         _usCached     = 999.0f;
+
+static float _singlePing() {
   digitalWrite(ULTRASONIC_TRIG, LOW);
-  delayMicroseconds(2);
+  delayMicroseconds(4);                          // clean LOW
   digitalWrite(ULTRASONIC_TRIG, HIGH);
   delayMicroseconds(10);
   digitalWrite(ULTRASONIC_TRIG, LOW);
-  long duration = pulseIn(ULTRASONIC_ECHO, HIGH, 30000);
-  if (duration == 0) return 999;
-  return (duration * 0.0343) / 2.0;
+  unsigned long dur = pulseIn(ULTRASONIC_ECHO, HIGH, 30000UL);
+  if (dur == 0) return 999.0f;
+  return (dur * 0.0343f) / 2.0f;
 }
 
-bool readInductive() {
-  return digitalRead(INDUCTIVE_PIN) == LOW;
+float readUltrasonicCm() {
+  unsigned long now = millis();
+  if (now - _usLastReadMs < US_POLL_MS) return _usCached;  // use cached value
+  _usLastReadMs = now;
+
+  // Median of US_SAMPLES readings
+  float s[US_SAMPLES];
+  for (int i = 0; i < US_SAMPLES; i++) {
+    s[i] = _singlePing();
+    if (i < US_SAMPLES - 1) delay(US_SAMPLE_GAP_MS);
+  }
+  // Simple sort (insertion)
+  for (int i = 1; i < US_SAMPLES; i++) {
+    float key = s[i]; int j = i - 1;
+    while (j >= 0 && s[j] > key) { s[j+1] = s[j]; j--; }
+    s[j+1] = key;
+  }
+  _usCached = s[US_SAMPLES / 2];  // median
+  return _usCached;
+}
+
+// ── INDUCTIVE WITH TIMED LATCH ─────────────────────────────────
+// Returns true if metal is currently detected OR if the latch is active.
+// When the physical sensor goes LOW (metal detected with NPN NO), we
+// start a timer. The reading stays true for INDUCTIVE_LATCH_MS ms.
+bool readInductiveLatched() {
+  unsigned long now = millis();
+  bool physical = (digitalRead(INDUCTIVE_PIN) == LOW);  // NPN NO: LOW = metal present
+  
+  if (physical) {
+    // Metal is physically present - start/extend the latch
+    inductiveLatchStartMs = now;
+    inductiveLatched = true;
+    return true;
+  }
+  
+  // No physical detection - check if latch is still active
+  if (inductiveLatched) {
+    if (now - inductiveLatchStartMs < INDUCTIVE_LATCH_MS) {
+      return true;  // Latch still active
+    } else {
+      inductiveLatched = false;  // Latch expired
+      return false;
+    }
+  }
+  
+  return false;
+}
+
+// Legacy wrapper for compatibility (returns raw state without latch)
+bool readInductiveRaw() {
+  return (digitalRead(INDUCTIVE_PIN) == LOW);
 }
 
 // ── SORTING SENSOR HANDLER ───────────────────────────────────
 // Ultrasonic is the primary detector (any object).
-// Inductive decides material:
+// Inductive decides material (with latch):
 //   US + IND  → METAL path
 //   US only   → NON-METAL path
 //   IND only  → No action (no object confirmed)
@@ -145,29 +215,64 @@ void handleSensorAutomation() {
   float dist = readUltrasonicCm();
   lastDistanceCm = dist;
   bool ultrasonicNow = (dist >= ULTRASONIC_MIN_CM && dist <= ULTRASONIC_MAX_CM);
-  bool inductiveNow = readInductive();
+  
+  // Use the LATCHED inductive reading for automation decisions
+  bool inductiveLatchedNow = readInductiveLatched();
+  // Also keep raw reading for display purposes
+  bool inductiveRawNow = readInductiveRaw();
+  
+  lastInductive = inductiveLatchedNow;
 
-  lastInductive = inductiveNow;
+  // ── LIVE SERIAL MONITOR OUTPUT (every 500 ms) ─────────────────
+  static unsigned long _lastSerialMs = 0;
+  if (millis() - _lastSerialMs >= 500) {
+    _lastSerialMs = millis();
+    Serial.print("[US] Distance: ");
+    if (dist >= 999.0f) {
+      Serial.print("NO ECHO");
+    } else {
+      Serial.print(dist, 1);
+      Serial.print(" cm");
+    }
+    Serial.print("  |  In range (");
+    Serial.print(ULTRASONIC_MIN_CM);
+    Serial.print("-");
+    Serial.print(ULTRASONIC_MAX_CM);
+    Serial.print(" cm): ");
+    Serial.print(ultrasonicNow ? "YES" : "NO");
+    Serial.print("  |  Inductive (latched): ");
+    Serial.print(inductiveLatchedNow ? "METAL" : "none");
+    Serial.print("  |  Inductive (raw): ");
+    Serial.print(inductiveRawNow ? "METAL" : "none");
+    if (inductiveLatchedNow && !inductiveRawNow) {
+      unsigned long remaining = INDUCTIVE_LATCH_MS - (millis() - inductiveLatchStartMs);
+      Serial.print("  [LATCHED for ");
+      Serial.print(remaining);
+      Serial.print("ms more]");
+    }
+    Serial.println();
+  }
+  // ─────────────────────────────────────────────────────────────
 
   if (!sensorAutoEnabled || sensorAutoRunning) {
     lastUltrasonic = ultrasonicNow;
-    lastBothTriggered = ultrasonicNow && inductiveNow;
+    lastBothTriggered = ultrasonicNow && inductiveLatchedNow;
     return;
   }
 
   // Detect RISING EDGE on ultrasonic (object just arrived)
   bool ultrasonicRising = ultrasonicNow && !lastUltrasonic;
   lastUltrasonic = ultrasonicNow;
-  lastBothTriggered = ultrasonicNow && inductiveNow;
+  lastBothTriggered = ultrasonicNow && inductiveLatchedNow;
 
   if (!ultrasonicRising) return;
 
-  // Object detected by ultrasonic – decide material
-  if (inductiveNow) {
+  // Object detected by ultrasonic – decide material using LATCHED reading
+  if (inductiveLatchedNow) {
     // ── METAL OBJECT ──
     Serial.print("[SENSOR] Object detected! Distance: ");
     Serial.print(dist);
-    Serial.println(" cm. Material: METAL");
+    Serial.println(" cm. Material: METAL (latched)");
 
     if (sensorPathMetalLength >= 2) {
       sensorAutoRunning = true;
@@ -211,7 +316,7 @@ void handleSensorAutomation() {
 
       sensorAutoRunning = false;
       if (sensorAutoEnabled) {
-        pathMsg = "SENSOR: Non-metal path done. Waiting for next object...";
+        pathMsg = "SENSOR: Non-metal path complete. Waiting for next object...";
         Serial.println("[SENSOR] Non-metal path complete.");
       }
     } else {
@@ -222,7 +327,7 @@ void handleSensorAutomation() {
 }
 
 // ── HTML PAGE ──────────────────────────────────────────────────
-const char PAGE[] PROGMEM = "<!DOCTYPE html><html><head><meta name=viewport content=width=device-width,initial-scale=1><title>Robot Arm</title><style>body{font-family:Arial;background:#0d1117;color:#e6edf3;padding:12px;margin:0}h2{color:#58a6ff;text-align:center;margin-bottom:14px}.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px}.row{display:flex;align-items:center;gap:8px;margin-bottom:6px}.row label{font-size:.8em;color:#8b949e;min-width:100px}input[type=range]{flex:1;accent-color:#58a6ff}.v{font-weight:bold;color:#58a6ff;min-width:36px;font-size:.85em}.btn{width:100%;padding:9px;border:none;border-radius:6px;font-weight:bold;cursor:pointer;margin-top:5px}.gr{background:#238636;color:#fff}.rd{background:#da3633;color:#fff}.gy{background:#21262d;color:#8b949e;border:1px solid #30363d}.bl{background:#1f6feb;color:#fff}.yl{background:#d29922;color:#fff}.st{text-align:center;font-size:.8em;color:#8b949e;margin-top:6px}input[type=number]{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:4px;padding:4px 6px;width:70px}.sensor-box{font-size:1.1em;text-align:center;padding:10px;border-radius:6px;margin-bottom:10px;font-weight:bold}.sensor-both{background:#23863633;border:1px solid #238636;color:#3fb950}.sensor-wait{background:#1f6feb33;border:1px solid #1f6feb;color:#58a6ff}.sensor-one{background:#d2992233;border:1px solid #d29922;color:#d29922}.sensor-off{background:#21262d33;border:1px solid #30363d;color:#8b949e}</style></head><body><h2>&#129470; Robot Arm</h2><div class=card><b style=font-size:.85em>Move time (ms):</b> <input type=number id=ms value=1000 min=100 step=100></div><div class=card><div class=row><label>J1 Base Yaw</label><input type=range min=-90 max=90 value=0.0 id=s0 oninput=\"mv(0,this.value)\"><span class=v id=v0>0.0</span></div><div class=row><label>J2 Shoulder</label><input type=range min=-70 max=60 value=60.0 id=s1 oninput=\"mv(1,this.value)\"><span class=v id=v1>60.0</span></div><div class=row><label>J3 Elbow</label><input type=range min=-75 max=75 value=-120.0 id=s2 oninput=\"mv(2,this.value)\"><span class=v id=v2>-120.0</span></div><div class=row><label>J4 Wrist Pi</label><input type=range min=-70 max=70 value=60.0 id=s3 oninput=\"mv(3,this.value)\"><span class=v id=v3>60.0</span></div><div class=row><label>J5 Wrist Ro</label><input type=range min=-90 max=90 value=0.0 id=s4 oninput=\"mv(4,this.value)\"><span class=v id=v4>0.0</span></div><div class=row><label>J6 Gripper</label><input type=range min=-90 max=90 value=0.0 id=s5 oninput=\"mv(5,this.value)\"><span class=v id=v5>0.0</span></div><button class=\"btn gy\" onclick=\"rst()\">Reset (Home)</button></div><div class=card><b style=font-size:.85em>Path Control</b><button class=\"btn gr\" onclick=\"run()\">&#9654; Run Path</button><button class=\"btn rd\" onclick=\"stp()\" style=margin-top:6px>&#9209; Stop</button><div class=st id=st>Ready</div></div><div class=card><b style=font-size:.85em>Sensor Automation (Sorting)</b><div id=sensorBox class=\"sensor-box sensor-off\">&#9203; Auto OFF</div><div style=font-size:.75em;color:#8b949e;text-align:center;margin-bottom:8px>US: <span id=us>--</span> cm | IND: <span id=ind>--</span> | BOTH: <span id=both>--</span></div><button class=\"btn bl\" onclick=\"sensorStart()\">&#9654; Start Sensor Auto</button><button class=\"btn rd\" onclick=\"sensorStop()\" style=margin-top:6px>&#9209; Stop Sensor Auto</button><div class=st id=sensorSt>Sensor Auto: OFF</div></div><script>function mv(n,v){document.getElementById('v'+n).innerText=v;fetch('/set?servo='+n+'&angle='+v+'&time='+document.getElementById('ms').value);}function rst(){fetch('/reset');const st=[0.0,60.0,-120.0,60.0,0.0,0.0];for(let i=0;i<6;i++){var s=document.getElementById('s'+i);if(s){s.value=st[i];document.getElementById('v'+i).innerText=st[i];}}}function run(){fetch('/run');document.getElementById('st').innerText='Running...';}function stp(){fetch('/stop');document.getElementById('st').innerText='Stopped.';}function sensorStart(){fetch('/sensor_start');document.getElementById('sensorSt').innerText='Sensor Auto: RUNNING';}function sensorStop(){fetch('/sensor_stop');document.getElementById('sensorSt').innerText='Sensor Auto: STOPPED';}setInterval(()=>fetch('/status').then(r=>r.text()).then(t=>{if(t)document.getElementById('st').innerText=t;}),800);setInterval(()=>fetch('/sensor_full_status').then(r=>r.json()).then(d=>{const el=document.getElementById('sensorBox');document.getElementById('us').innerText=d.dist.toFixed(1);document.getElementById('ind').innerText=d.ind==1?'METAL':'none';document.getElementById('both').innerText=d.both==1?'YES':'NO';if(d.auto==0){el.className='sensor-box sensor-off';el.innerHTML='&#9203; Auto OFF';}else if(d.us==1&&d.ind==1){el.className='sensor-box sensor-both';el.innerHTML='&#9989; METAL OBJECT! Running metal...';}else if(d.us==1&&d.ind==0){el.className='sensor-box sensor-one';el.innerHTML='&#9898; NON-METAL OBJECT! Running non-metal...';}else if(d.us==0&&d.ind==1){el.className='sensor-box sensor-one';el.innerHTML='&#9888; Inductive only (no object)';}else{el.className='sensor-box sensor-wait';el.innerHTML='&#9203; Waiting for object...';}}),400);<\/script></body></html>";
+const char PAGE[] PROGMEM = "<!DOCTYPE html><html><head><meta name=viewport content=width=device-width,initial-scale=1><title>Robot Arm</title><style>body{font-family:Arial;background:#0d1117;color:#e6edf3;padding:12px;margin:0}h2{color:#58a6ff;text-align:center;margin-bottom:14px}.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px}.row{display:flex;align-items:center;gap:8px;margin-bottom:6px}.row label{font-size:.8em;color:#8b949e;min-width:100px}input[type=range]{flex:1;accent-color:#58a6ff}.v{font-weight:bold;color:#58a6ff;min-width:36px;font-size:.85em}.btn{width:100%;padding:9px;border:none;border-radius:6px;font-weight:bold;cursor:pointer;margin-top:5px}.gr{background:#238636;color:#fff}.rd{background:#da3633;color:#fff}.gy{background:#21262d;color:#8b949e;border:1px solid #30363d}.bl{background:#1f6feb;color:#fff}.yl{background:#d29922;color:#fff}.st{text-align:center;font-size:.8em;color:#8b949e;margin-top:6px}input[type=number]{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:4px;padding:4px 6px;width:70px}.sensor-box{font-size:1.1em;text-align:center;padding:10px;border-radius:6px;margin-bottom:10px;font-weight:bold}.sensor-both{background:#23863633;border:1px solid #238636;color:#3fb950}.sensor-wait{background:#1f6feb33;border:1px solid #1f6feb;color:#58a6ff}.sensor-one{background:#d2992233;border:1px solid #d29922;color:#d29922}.sensor-off{background:#21262d33;border:1px solid #30363d;color:#8b949e}.latch-info{font-size:.75em;color:#8b949e;text-align:center;margin-top:4px}</style></head><body><h2>&#129470; Robot Arm</h2><div class=card><b style=font-size:.85em>Move time (ms):</b> <input type=number id=ms value=1000 min=100 step=100></div><div class=card><div class=row><label>J1 Base Yaw</label><input type=range min=-90 max=90 value=0.0 id=s0 oninput=\"mv(0,this.value)\"><span class=v id=v0>0.0</span></div><div class=row><label>J2 Shoulder</label><input type=range min=-70 max=60 value=60.0 id=s1 oninput=\"mv(1,this.value)\"><span class=v id=v1>60.0</span></div><div class=row><label>J3 Elbow</label><input type=range min=-75 max=75 value=-120.0 id=s2 oninput=\"mv(2,this.value)\"><span class=v id=v2>-120.0</span></div><div class=row><label>J4 Wrist Pi</label><input type=range min=-70 max=70 value=60.0 id=s3 oninput=\"mv(3,this.value)\"><span class=v id=v3>60.0</span></div><div class=row><label>J5 Wrist Ro</label><input type=range min=-90 max=90 value=0.0 id=s4 oninput=\"mv(4,this.value)\"><span class=v id=v4>0.0</span></div><div class=row><label>J6 Gripper</label><input type=range min=-90 max=90 value=0.0 id=s5 oninput=\"mv(5,this.value)\"><span class=v id=v5>0.0</span></div><button class=\"btn gy\" onclick=\"rst()\">Reset (Home)</button></div><div class=card><b style=font-size:.85em>Path Control</b><button class=\"btn gr\" onclick=\"run()\">&#9654; Run Path</button><button class=\"btn rd\" onclick=\"stp()\" style=margin-top:6px>&#9209; Stop</button><div class=st id=st>Ready</div></div><div class=card><b style=font-size:.85em>Sensor Automation (Sorting)</b><div id=sensorBox class=\"sensor-box sensor-off\">&#9203; Auto OFF</div><div style=font-size:.75em;color:#8b949e;text-align:center;margin-bottom:8px>US: <span id=us>--</span> cm | IND: <span id=ind>--</span> | BOTH: <span id=both>--</span></div><div class=latch-info>Inductive latch: <span id=latch>OFF</span></div><button class=\"btn bl\" onclick=\"sensorStart()\">&#9654; Start Sensor Auto</button><button class=\"btn rd\" onclick=\"sensorStop()\" style=margin-top:6px>&#9209; Stop Sensor Auto</button><div class=st id=sensorSt>Sensor Auto: OFF</div></div><script>function mv(n,v){document.getElementById('v'+n).innerText=v;fetch('/set?servo='+n+'&angle='+v+'&time='+document.getElementById('ms').value);}function rst(){fetch('/reset');const st=[0.0,60.0,-120.0,60.0,0.0,0.0];for(let i=0;i<<6;i++){var s=document.getElementById('s'+i);if(s){s.value=st[i];document.getElementById('v'+i).innerText=st[i];}}}function run(){fetch('/run');document.getElementById('st').innerText='Running...';}function stp(){fetch('/stop');document.getElementById('st').innerText='Stopped.';}function sensorStart(){fetch('/sensor_start');document.getElementById('sensorSt').innerText='Sensor Auto: RUNNING';}function sensorStop(){fetch('/sensor_stop');document.getElementById('sensorSt').innerText='Sensor Auto: STOPPED';}setInterval(()=>fetch('/status').then(r=>r.text()).then(t=>{if(t)document.getElementById('st').innerText=t;}),800);setInterval(()=>fetch('/sensor_full_status').then(r=>r.json()).then(d=>{const el=document.getElementById('sensorBox');document.getElementById('us').innerText=d.dist.toFixed(1);document.getElementById('ind').innerText=d.ind==1?'METAL':'none';document.getElementById('both').innerText=d.both==1?'YES':'NO';document.getElementById('latch').innerText=d.latch==1?'ACTIVE ('+d.latch_remaining+'ms)':'OFF';if(d.auto==0){el.className='sensor-box sensor-off';el.innerHTML='&#9203; Auto OFF';}else if(d.us==1&&d.ind==1){el.className='sensor-box sensor-both';el.innerHTML='&#9989; METAL OBJECT! Running metal...';}else if(d.us==1&&d.ind==0){el.className='sensor-box sensor-one';el.innerHTML='&#9898; NON-METAL OBJECT! Running non-metal...';}else if(d.us==0&&d.ind==1){el.className='sensor-box sensor-one';el.innerHTML='&#9888; Inductive only (no object)';}else{el.className='sensor-box sensor-wait';el.innerHTML='&#9203; Waiting for object...';}}),400);<<\/script></body></html>";
 
 void sendCORS() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -251,6 +356,7 @@ void setup() {
   Serial.println("SENSOR SORTING SYSTEM:");
   Serial.println("  Ultrasonic detects object → Inductive checks material");
   Serial.println("  US + IND = METAL path | US only = NON-METAL path");
+  Serial.println("  Inductive LATCH: " + String(INDUCTIVE_LATCH_MS) + " ms");
   Serial.println("  Ultrasonic: GPIO" + String(ULTRASONIC_TRIG) + "/" + String(ULTRASONIC_ECHO));
   Serial.println("  Inductive:  GPIO" + String(INDUCTIVE_PIN));
   Serial.println("  Range: " + String(ULTRASONIC_MIN_CM) + "-" + String(ULTRASONIC_MAX_CM) + " cm");
@@ -290,21 +396,23 @@ void setup() {
 
   server.on("/sensor_status", []() {
     sendCORS();
-    server.send(200, "text/plain", readInductive() ? "1" : "0");
+    server.send(200, "text/plain", readInductiveLatched() ? "1" : "0");
   });
   server.on("/sensor_start", []() {
     sendCORS();
     sensorAutoEnabled = true;
     sensorAutoRunning = false;
     lastBothTriggered = false;
-    pathMsg = "Sensor automation STARTED - AND logic";
-    Serial.println("[SENSOR] Automation STARTED (AND logic)");
+    inductiveLatched = false;  // Reset latch on start
+    pathMsg = "Sensor automation STARTED - with inductive latch";
+    Serial.println("[SENSOR] Automation STARTED (with " + String(INDUCTIVE_LATCH_MS) + "ms inductive latch)");
     server.send(200, "text/plain", "Sensor automation started");
   });
   server.on("/sensor_stop", []() {
     sendCORS();
     sensorAutoEnabled = false;
     sensorAutoRunning = false;
+    inductiveLatched = false;  // Clear latch on stop
     pathMsg = "Sensor automation STOPPED";
     Serial.println("[SENSOR] Automation STOPPED");
     server.send(200, "text/plain", "Sensor automation stopped");
@@ -314,13 +422,25 @@ void setup() {
     sendCORS();
     float dist = lastDistanceCm;
     bool us = (dist >= ULTRASONIC_MIN_CM && dist <= ULTRASONIC_MAX_CM);
-    bool ind = lastInductive;
-    bool both = us && ind;
+    bool indLatched = lastInductive;
+    bool indRaw = readInductiveRaw();
+    bool both = us && indLatched;
+    
+    // Calculate remaining latch time
+    long latchRemaining = 0;
+    if (inductiveLatched && !indRaw) {
+      latchRemaining = INDUCTIVE_LATCH_MS - (millis() - inductiveLatchStartMs);
+      if (latchRemaining < 0) latchRemaining = 0;
+    }
+    
     String json = "{";
     json += "\"auto\":" + String(sensorAutoEnabled ? 1 : 0) + ",";
     json += "\"us\":" + String(us ? 1 : 0) + ",";
-    json += "\"ind\":" + String(ind ? 1 : 0) + ",";
+    json += "\"ind\":" + String(indLatched ? 1 : 0) + ",";
+    json += "\"ind_raw\":" + String(indRaw ? 1 : 0) + ",";
     json += "\"both\":" + String(both ? 1 : 0) + ",";
+    json += "\"latch\":" + String(inductiveLatched ? 1 : 0) + ",";
+    json += "\"latch_remaining\":" + String(latchRemaining) + ",";
     json += "\"dist\":" + String(dist);
     json += "}";
     server.send(200, "application/json", json);
